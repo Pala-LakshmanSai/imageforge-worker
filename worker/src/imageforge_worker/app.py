@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
+import os
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -124,7 +125,15 @@ async def _boot(runtime: WorkerRuntime) -> None:
         raise
     except Exception as exc:
         error_id = uuid.uuid4().hex
-        logger.error("worker boot failed error_id=%s error_type=%s", error_id, type(exc).__name__)
+        diagnostic_message = "<redacted>"
+        if os.environ.get("IMAGEFORGE_BOOT_DIAGNOSTICS") == "1":
+            diagnostic_message = " ".join(str(exc).split())[:240]
+        logger.error(
+            "worker boot failed error_id=%s error_type=%s error_message=%s",
+            error_id,
+            type(exc).__name__,
+            diagnostic_message,
+        )
         await runtime.controller.release_lease_after_boot_failure()
         await runtime.health.fail(error_id)
 

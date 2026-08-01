@@ -1,0 +1,58 @@
+name: Publish ImageForge worker
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "worker/**"
+      - ".github/workflows/publish-worker.yml"
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    name: Build and publish immutable amd64 worker
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Normalize image name
+        id: image
+        shell: bash
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/imageforge-worker" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and publish
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: ./worker
+          file: ./worker/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ steps.image.outputs.name }}:sha-${{ github.sha }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+          provenance: true
+          sbom: true
+          cache-from: type=gha,scope=imageforge-worker
+          cache-to: type=gha,mode=max,scope=imageforge-worker
+
+      - name: Print immutable image reference
+        run: |
+          echo "Image digest: ${{ steps.build.outputs.digest }}"
+          echo "Use this exact reference in RunPod: ${{ steps.image.outputs.name }}@${{ steps.build.outputs.digest }}"

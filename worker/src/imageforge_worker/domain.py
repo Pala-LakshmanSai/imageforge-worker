@@ -1,0 +1,269 @@
+from __future__ import annotations
+
+from datetime import UTC, datetime
+from enum import StrEnum
+from typing import Literal
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from .constants import (
+    API_SCHEMA_VERSION,
+    GUIDANCE_SCALE,
+    INFERENCE_STEPS,
+    JPEG_QUALITY,
+    MAX_PROMPT_UTF8_BYTES,
+    MAX_PROMPTS,
+    MODEL_ID,
+    MODEL_PRECISION,
+    MODEL_REVISION,
+    OUTPUT_HEIGHT,
+    OUTPUT_WIDTH,
+    PREVIEW_HEIGHT,
+    PREVIEW_WIDTH,
+)
+
+
+def utc_now() -> str:
+    return datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+class StrictModel(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True, validate_assignment=True)
+
+
+class HealthPhase(StrEnum):
+    PROCESS = "process"
+    STORAGE = "storage"
+    WEIGHTS = "weights"
+    GPU_LOAD = "gpu_load"
+    WARMUP = "warmup"
+    READY = "ready"
+    ERROR = "error"
+
+
+class BatchState(StrEnum):
+    RUNNING = "running"
+    PAUSED = "paused"
+    COMPLETED = "completed"
+    CANCELLED = "cancelled"
+    FAILED = "failed"
+    INTERRUPTED = "interrupted"
+
+
+class ImageState(StrEnum):
+    PENDING = "pending"
+    GENERATING = "generating"
+    RETRYING = "retrying"
+    READY = "ready"
+    DOWNLOADED = "downloaded"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+LOCK_HOLDING_STATES = {BatchState.RUNNING, BatchState.PAUSED, BatchState.INTERRUPTED}
+SUCCESS_STATES = {ImageState.READY, ImageState.DOWNLOADED}
+NONTERMINAL_IMAGE_STATES = {
+    ImageState.PENDING,
+    ImageState.GENERATING,
+    ImageState.RETRYING,
+}
+
+
+class CreateBatchRequest(StrictModel):
+    prompts: list[str] = Field(min_length=1, max_length=MAX_PROMPTS)
+    base_seed: int = Field(default=0, ge=0, le=(2**63 - 1) - MAX_PROMPTS)
+
+    @field_validator("prompts")
+    @classmethod
+    def validate_prompts(cls, prompts: list[str]) -> list[str]:
+        for prompt in prompts:
+            if not prompt.strip():
+                raise ValueError("prompts cannot be blank")
+            if len(prompt.encode("utf-8")) > MAX_PROMPT_UTF8_BYTES:
+                raise ValueError(f"each prompt is limited to {MAX_PROMPT_UTF8_BYTES} UTF-8 bytes")
+        return prompts
+
+
+class GenerationSettings(StrictModel):
+    model: Literal[MODEL_ID] = MODEL_ID
+    revision: Literal[MODEL_REVISION] = MODEL_REVISION
+    precision: Literal[MODEL_PRECISION] = MODEL_PRECISION
+    width: Literal[OUTPUT_WIDTH] = OUTPUT_WIDTH
+    height: Literal[OUTPUT_HEIGHT] = OUTPUT_HEIGHT
+    steps: Literal[INFERENCE_STEPS] = INFERENCE_STEPS
+    guidance: Literal[GUIDANCE_SCALE] = GUIDANCE_SCALE
+    jpeg_quality: Literal[JPEG_QUALITY] = JPEG_QUALITY
+    preview_width: Literal[PREVIEW_WIDTH] = PREVIEW_WIDTH
+    preview_height: Literal[PREVIEW_HEIGHT] = PREVIEW_HEIGHT
+
+
+class BatchOwner(StrictModel):
+    user_id: str
+    display_name: str
+
+
+class SafeImageError(StrictModel):
+    code: str
+    message: str
+
+
+class AttemptRecord(StrictModel):
+    attempt: int = Field(ge=1)
+    started_at: str
+    finished_at: str
+    status: Literal["succeeded", "failed"]
+    inference_ms: float | None = Field(default=None, ge=0)
+    jpeg_encode_ms: float | None = Field(default=None, ge=0)
+    preview_encode_ms: float | None = Field(default=None, ge=0)
+    error_code: str | None = None
+
+
+class StoredReceipt(StrictModel):
+    user_id: str
+    sha256: str
+    size_bytes: int = Field(ge=1)
+    acknowledged_at: str
+
+
+class ImageRecord(StrictModel):
+    index: int = Field(ge=1)
+    prompt: str
+    seed: int = Field(ge=0)
+    status: ImageState = ImageState.PENDING
+    attempts: int = Field(default=0, ge=0)
+    attempts_in_cycle: int = Field(default=0, ge=0)
+    retry_rounds: int = Field(default=0, ge=0)
+    attempt_history: list[AttemptRecord] = Field(default_factory=list)
+    filename: str | None = None
+    preview_filename: str | None = None
+    sha256: str | None = None
+    preview_sha256: str | None = None
+    size_bytes: int | None = Field(default=None, ge=1)
+    preview_size_bytes: int | None = Field(default=None, ge=1)
+    started_at: str | None = None
+    finished_at: str | None = None
+    generation_ms: float | None = Field(default=None, ge=0)
+    error: SafeImageError | None = None
+    receipt: StoredReceipt | None = None
+    artifacts_cleanup_started_at: str | None = None
+    artifacts_deleted_at: str | None = None
+
+    @property
+    def artifacts_expired(self) -> bool:
+        return (
+            self.artifacts_cleanup_started_at is not None or self.artifacts_deleted_at is not None
+        )
+
+    def clear_artifact(self) -> None:
+        self.filename = None
+        self.preview_filename = None
+        self.sha256 = None
+        self.preview_sha256 = None
+        self.size_bytes = None
+        self.preview_size_bytes = None
+        self.finished_at = None
+        self.generation_ms = None
+        self.receipt = None
+        self.artifacts_cleanup_started_at = None
+        self.artifacts_deleted_at = None
+
+
+class BatchProgress(StrictModel):
+    total: int = Field(ge=1)
+    completed: int = Field(default=0, ge=0)
+    downloaded: int = Field(default=0, ge=0)
+    failed: int = Field(default=0, ge=0)
+    cancelled: int = Field(default=0, ge=0)
+    processed: int = Field(default=0, ge=0)
+    current_index: int | None = Field(default=None, ge=1)
+
+
+class BatchManifest(StrictModel):
+    schema_version: Literal[API_SCHEMA_VERSION] = API_SCHEMA_VERSION
+    batch_id: str
+    owner: BatchOwner
+    state: BatchState
+    created_at: str
+    updated_at: str
+    completed_at: str | None = None
+    interrupted_at: str | None = None
+    pause_requested: bool = False
+    cancel_requested: bool = False
+    settings: GenerationSettings = Field(default_factory=GenerationSettings)
+    images: list[ImageRecord]
+    progress: BatchProgress
+
+    @model_validator(mode="after")
+    def validate_order(self) -> BatchManifest:
+        expected = list(range(1, len(self.images) + 1))
+        if [image.index for image in self.images] != expected:
+            raise ValueError("manifest image indices must be contiguous and ordered")
+        if self.progress.total != len(self.images):
+            raise ValueError("manifest total must match image count")
+        return self
+
+    def recalculate_progress(self) -> None:
+        completed = sum(image.status in SUCCESS_STATES for image in self.images)
+        downloaded = sum(image.status == ImageState.DOWNLOADED for image in self.images)
+        failed = sum(image.status == ImageState.FAILED for image in self.images)
+        cancelled = sum(image.status == ImageState.CANCELLED for image in self.images)
+        current = next(
+            (image.index for image in self.images if image.status == ImageState.GENERATING),
+            None,
+        )
+        self.progress = BatchProgress(
+            total=len(self.images),
+            completed=completed,
+            downloaded=downloaded,
+            failed=failed,
+            cancelled=cancelled,
+            processed=completed + failed + cancelled,
+            current_index=current,
+        )
+        self.updated_at = utc_now()
+
+
+class BatchSummary(StrictModel):
+    batch_id: str
+    owner: BatchOwner
+    state: BatchState
+    progress: BatchProgress
+    pause_requested: bool
+    cancel_requested: bool
+
+
+class StatusPermissions(StrictModel):
+    can_create: bool
+    can_manage_active: bool
+    is_owner: bool
+
+
+class StatusResponse(StrictModel):
+    schema_version: Literal[API_SCHEMA_VERSION] = API_SCHEMA_VERSION
+    ready: bool
+    active_batch: BatchSummary | None
+    permissions: StatusPermissions
+
+
+class ReceiptItem(StrictModel):
+    index: int = Field(ge=1)
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    size_bytes: int = Field(ge=1)
+
+
+class ReceiptRequest(StrictModel):
+    receipts: list[ReceiptItem] = Field(min_length=1, max_length=MAX_PROMPTS)
+
+    @model_validator(mode="after")
+    def unique_indices(self) -> ReceiptRequest:
+        indices = [receipt.index for receipt in self.receipts]
+        if len(indices) != len(set(indices)):
+            raise ValueError("receipt indices must be unique")
+        return self
+
+
+class ReceiptResponse(StrictModel):
+    schema_version: Literal[API_SCHEMA_VERSION] = API_SCHEMA_VERSION
+    batch_id: str
+    accepted: list[int]
+    progress: BatchProgress

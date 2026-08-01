@@ -1,0 +1,54 @@
+[build-system]
+requires = ["hatchling==1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "imageforge-worker"
+version = "0.1.0"
+description = "Durable single-GPU FastAPI worker for ImageForge"
+readme = "README.md"
+requires-python = "==3.11.*"
+dependencies = [
+  "fastapi==0.141.1",
+  "pillow==12.3.0",
+  "pydantic==2.13.4",
+  "uvicorn[standard]==0.52.0",
+]
+
+[project.optional-dependencies]
+gpu = [
+  "accelerate==1.14.0",
+  "diffusers==0.39.0",
+  "huggingface-hub==1.26.0",
+  "safetensors==0.8.0",
+  "torch==2.13.0",
+  "transformers==5.14.1",
+]
+test = [
+  "anyio==4.14.2",
+  "httpx==0.28.1",
+  "pytest==9.1.1",
+  "ruff==0.15.6",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/imageforge_worker"]
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-markers"
+testpaths = ["tests"]
+markers = [
+  "endurance: deterministic long-path batch test",
+  "real_gpu: requires an explicitly enabled paid GPU environment",
+]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC", "S"]
+ignore = ["S101"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["ASYNC109", "S105"]

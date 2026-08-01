@@ -17,7 +17,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from .auth import BearerAuthenticator, Principal
 from .config import WorkerSettings
-from .constants import API_SCHEMA_VERSION, MAX_PROMPTS, WORKER_VERSION
+from .constants import API_SCHEMA_VERSION, WORKER_VERSION
 from .controller import ArtifactDescriptor, GenerationController
 from .domain import (
     BatchManifest,
@@ -42,7 +42,7 @@ async def _authenticated_principal(request: Request) -> Principal:
 
 PrincipalDependency = Annotated[Principal, Depends(_authenticated_principal)]
 BatchId = Annotated[UUID, PathParameter(description="Server-generated batch UUID")]
-ImageIndex = Annotated[int, PathParameter(ge=1, le=MAX_PROMPTS)]
+ImageIndex = Annotated[int, PathParameter(ge=1)]
 
 
 @dataclass(slots=True)

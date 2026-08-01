@@ -14,7 +14,10 @@ It never creates, stops, or terminates a Pod.
 - output: 1280x720 JPEG quality 95 and 320x180 WebP preview
 - inference: four steps, guidance 1.0
 - retries: one initial attempt and two automatic retries
-- prompts: 1-500, at most 4096 UTF-8 bytes each
+- prompts: any non-empty finite list; prompt text is preserved without a product
+  count or per-prompt byte cap
+- references: optional batch-level JPEG, PNG, or WebP images (up to 8 files,
+  8 MiB each and 32 MiB total); manifests retain only safe metadata and checksums
 
 The pinned Python 3.11 slim image plus the SHA-256-pinned `torch==2.13.0+cu130`
 wheel supports the approved Ampere, Ada, and Blackwell families; RunPod supplies
@@ -130,8 +133,10 @@ digest, and results; any failure disqualifies that storage configuration.
 
 ## API behavior
 
-`POST /v1/batches` accepts `{"prompts":[...],"base_seed":0}`. Batch IDs and
-all paths are server generated. If a lease is already held, the server returns
+`POST /v1/batches` accepts `{"prompts":[...],"base_seed":0,"references":[{"name":"anchor.png","mime_type":"image/png","data_hex":"..."}]}`.
+References are optional, batch-level, and apply to every prompt; raw bytes are
+stored only as temporary worker files and never copied into prompt text or logs.
+Batch IDs and all paths are server generated. If a lease is already held, the server returns
 HTTP 423 with stable code `batch_busy`, the owner's display name, and progress;
 there is no queue. Pause stops before the next image while retaining the lease.
 Cancel allows the current image to finish, cancels the remainder, and releases

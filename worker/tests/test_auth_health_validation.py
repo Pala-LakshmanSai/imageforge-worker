@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 
@@ -7,7 +8,8 @@ import pytest
 from conftest import auth, wait_for_health, worker_client
 
 from imageforge_worker.config import Credential, WorkerSettings
-from imageforge_worker.constants import MODEL_REVISION
+from imageforge_worker.constants import MAX_REFERENCE_BYTES, MODEL_REVISION
+from imageforge_worker.domain import CreateBatchRequest, ReceiptRequest
 from imageforge_worker.inference import FakeInferenceAdapter
 
 
@@ -96,7 +98,7 @@ async def test_non_ascii_authorization_is_always_a_safe_401(tmp_path: Path) -> N
 
 
 @pytest.mark.anyio
-async def test_validation_is_bounded_strict_and_does_not_echo_prompts(tmp_path: Path) -> None:
+async def test_validation_is_strict_and_does_not_echo_prompts(tmp_path: Path) -> None:
     async with worker_client(tmp_path / "volume") as (client, _, _):
         sensitive_prompt = "DO-NOT-ECHO-THIS" + "x" * 4096
         response = await client.post(
@@ -109,16 +111,66 @@ async def test_validation_is_bounded_strict_and_does_not_echo_prompts(tmp_path: 
         assert sensitive_prompt not in response.text
         assert "../../etc/passwd" not in response.text
 
-        too_many = await client.post(
-            "/v1/batches",
-            json={"prompts": [f"prompt {index}" for index in range(501)]},
-            headers=auth(),
-        )
-        assert too_many.status_code == 422
-        assert "prompt 500" not in too_many.text
-
         wrong_type = await client.post("/v1/batches", json={"prompts": [123]}, headers=auth())
         assert wrong_type.status_code == 422
+
+
+def test_large_prompt_and_receipt_models_have_no_product_count_or_text_cap() -> None:
+    prompts = [f"prompt {index}" for index in range(501)]
+    prompts[500] = "long prompt " + "x" * 5000
+    request = CreateBatchRequest(prompts=prompts)
+    assert request.prompts == prompts
+
+    receipts = ReceiptRequest(
+        receipts=[
+            {"index": index, "sha256": "0" * 64, "size_bytes": 1}
+            for index in range(1, 502)
+        ]
+    )
+    assert len(receipts.receipts) == 501
+
+
+def test_reference_request_bounds_are_practical_and_typed() -> None:
+    with pytest.raises(ValueError):
+        CreateBatchRequest(
+            prompts=["safe"],
+            references=[
+                {
+                    "name": "too-large.png",
+                    "mime_type": "image/png",
+                    "data_hex": "00" * (MAX_REFERENCE_BYTES + 1),
+                }
+            ],
+        )
+    with pytest.raises(ValueError):
+        CreateBatchRequest(
+            prompts=["safe"],
+            references=[
+                {"name": f"ref-{index}.png", "mime_type": "image/png", "data_hex": "00"}
+                for index in range(9)
+            ],
+        )
+
+
+@pytest.mark.anyio
+async def test_create_batch_accepts_more_than_500_prompts_at_http_boundary(tmp_path: Path) -> None:
+    first_generation_started = asyncio.Event()
+    release_first_generation = asyncio.Event()
+    adapter = FakeInferenceAdapter(
+        first_generation_started=first_generation_started,
+        release_first_generation=release_first_generation,
+    )
+    async with worker_client(tmp_path / "volume", adapter) as (client, _, _):
+        prompts = [f"prompt {index}" for index in range(501)]
+        prompts[-1] = "long prompt " + "x" * 5000
+        response = await client.post(
+            "/v1/batches", json={"prompts": prompts, "base_seed": 123}, headers=auth()
+        )
+        assert response.status_code == 201
+        manifest = response.json()
+        assert manifest["progress"]["total"] == 501
+        assert [image["index"] for image in manifest["images"]] == list(range(1, 502))
+        assert manifest["images"][-1]["prompt"] == prompts[-1]
 
 
 @pytest.mark.anyio

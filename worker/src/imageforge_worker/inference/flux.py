@@ -121,15 +121,18 @@ class FluxInferenceAdapter:
         pipeline = self._pipeline
         torch.cuda.synchronize()
         inference_started = time.perf_counter()
+        pipeline_kwargs: dict[str, Any] = {
+            "prompt": job.prompt,
+            "height": job.settings.height,
+            "width": job.settings.width,
+            "guidance_scale": job.settings.guidance,
+            "num_inference_steps": job.settings.steps,
+            "generator": torch.Generator(device="cuda").manual_seed(job.seed),
+        }
+        if job.references:
+            pipeline_kwargs["image"] = list(job.references)
         with torch.inference_mode():
-            image = pipeline(
-                prompt=job.prompt,
-                height=job.settings.height,
-                width=job.settings.width,
-                guidance_scale=job.settings.guidance,
-                num_inference_steps=job.settings.steps,
-                generator=torch.Generator(device="cuda").manual_seed(job.seed),
-            ).images[0]
+            image = pipeline(**pipeline_kwargs).images[0]
         torch.cuda.synchronize()
         inference_ms = (time.perf_counter() - inference_started) * 1000
 

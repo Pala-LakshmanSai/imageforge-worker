@@ -12,6 +12,7 @@ from pathlib import Path
 from PIL import Image
 
 from .auth import Principal
+from .constants import MAX_REFERENCE_PIXELS
 from .domain import (
     LOCK_HOLDING_STATES,
     NONTERMINAL_IMAGE_STATES,
@@ -27,10 +28,12 @@ from .domain import (
     ImageState,
     ReceiptRequest,
     ReceiptResponse,
+    ReferenceInput,
     SafeImageError,
     StatusPermissions,
     StatusResponse,
     StoredReceipt,
+    StoredReference,
     utc_now,
 )
 from .errors import InferenceFailure, WorkerError
@@ -54,6 +57,12 @@ class _ClaimedAttempt:
     job: GenerationJob
     attempt: int
     started_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedReference:
+    metadata: StoredReference
+    payload: bytes
 
 
 class GenerationController:
@@ -212,6 +221,7 @@ class GenerationController:
         self, principal: Principal, request: CreateBatchRequest
     ) -> BatchManifest:
         self._ensure_initialized()
+        prepared_references = self._prepare_references(request.references)
         async with self._lock:
             await self._acquire_for_new_batch_locked()
             active = self._refresh_active_observation_locked()
@@ -229,11 +239,18 @@ class GenerationController:
                 state=BatchState.RUNNING,
                 created_at=now,
                 updated_at=now,
+                references=[reference.metadata for reference in prepared_references],
                 images=images,
                 progress=BatchProgress(total=len(images)),
             )
             try:
-                self.store.create(manifest)
+                self.store.create(
+                    manifest,
+                    reference_payloads=[
+                        (reference.metadata.filename, reference.payload)
+                        for reference in prepared_references
+                    ],
+                )
             except BaseException:
                 self.store.release_active_lease()
                 raise
@@ -525,12 +542,14 @@ class GenerationController:
             image.finished_at = None
             image.error = None
             self.store.save(manifest)
+            references = self._load_reference_images(manifest)
             return _ClaimedAttempt(
                 job=GenerationJob(
                     index=image.index,
                     prompt=image.prompt,
                     seed=image.seed,
                     settings=manifest.settings,
+                    references=references,
                 ),
                 attempt=image.attempts,
                 started_at=image.started_at,
@@ -633,6 +652,9 @@ class GenerationController:
                     if will_retry and self.retry_delay_seconds:
                         await asyncio.sleep(self.retry_delay_seconds)
                     continue
+                finally:
+                    for reference in claimed.job.references:
+                        reference.close()
                 await self._record_success(batch_id, claimed, result)
         except asyncio.CancelledError:
             raise
@@ -842,6 +864,69 @@ class GenerationController:
                 message="The requested image does not exist.",
             )
         return manifest.images[index - 1]
+
+    @staticmethod
+    def _prepare_references(references: list[ReferenceInput]) -> list[_PreparedReference]:
+        prepared: list[_PreparedReference] = []
+        extensions = {"image/jpeg": "jpg", "image/png": "png", "image/webp": "webp"}
+        for index, reference in enumerate(references, start=1):
+            payload = bytes.fromhex(reference.data_hex)
+            try:
+                GenerationController._validate_reference_payload(payload, reference.mime_type)
+            except (OSError, ValueError, Image.DecompressionBombError):
+                raise WorkerError(
+                    status_code=422,
+                    code="reference_invalid",
+                    message="A reference image is malformed or does not match its declared type.",
+                ) from None
+            prepared.append(
+                _PreparedReference(
+                    metadata=StoredReference(
+                        name=reference.name,
+                        mime_type=reference.mime_type,
+                        size_bytes=len(payload),
+                        sha256=hashlib.sha256(payload).hexdigest(),
+                        filename=f"references/{index:06d}.{extensions[reference.mime_type]}",
+                    ),
+                    payload=payload,
+                )
+            )
+        return prepared
+
+    def _load_reference_images(self, manifest: BatchManifest) -> tuple[Image.Image, ...]:
+        images: list[Image.Image] = []
+        try:
+            for reference in manifest.references:
+                payload = self.store.read_reference(manifest.batch_id, reference.filename)
+                checksum_matches = hashlib.sha256(payload).hexdigest() == reference.sha256
+                if len(payload) != reference.size_bytes or not checksum_matches:
+                    raise ValueError("reference checksum mismatch")
+                images.append(self._decode_reference_payload(payload, reference.mime_type))
+        except Exception:
+            for image in images:
+                image.close()
+            raise
+        return tuple(images)
+
+    @staticmethod
+    def _validate_reference_payload(payload: bytes, mime_type: str) -> None:
+        expected_format = {
+            "image/jpeg": "JPEG",
+            "image/png": "PNG",
+            "image/webp": "WEBP",
+        }[mime_type]
+        with Image.open(io.BytesIO(payload)) as image:
+            if image.format != expected_format:
+                raise ValueError("reference format does not match MIME type")
+            if image.width * image.height > MAX_REFERENCE_PIXELS:
+                raise ValueError("reference dimensions exceed the supported limit")
+            image.verify()
+
+    @classmethod
+    def _decode_reference_payload(cls, payload: bytes, mime_type: str) -> Image.Image:
+        cls._validate_reference_payload(payload, mime_type)
+        with Image.open(io.BytesIO(payload)) as image:
+            return image.convert("RGB")
 
     @staticmethod
     def _not_found() -> WorkerError:

@@ -15,9 +15,20 @@ JPEG_QUALITY: Final = 95
 PREVIEW_WIDTH: Final = 320
 PREVIEW_HEIGHT: Final = 180
 
-MAX_PROMPTS: Final = 500
-MAX_PROMPT_UTF8_BYTES: Final = 4096
+# Seeds are passed to the inference backend as signed 64-bit integers. Prompt
+# lists themselves are intentionally unbounded; practical request, storage,
+# and GPU limits remain outside the domain model.
+MAX_SEED: Final = 2**63 - 1
 MAX_GENERATION_ATTEMPTS: Final = 3
+
+# Batch-level reference images are deliberately bounded for predictable request
+# and GPU memory behavior. These are practical transport limits, not prompt
+# count limits.
+MAX_REFERENCES: Final = 8
+MAX_REFERENCE_BYTES: Final = 8 * 1024 * 1024
+MAX_REFERENCE_TOTAL_BYTES: Final = 32 * 1024 * 1024
+MAX_REFERENCE_NAME_BYTES: Final = 255
+MAX_REFERENCE_PIXELS: Final = 64_000_000
 
 # RunPod's approved emergency RTX 2000 Ada reports 16,380 MiB rather than the
 # nominal 16 GiB. Keep the allowance byte-exact and limited to that 4 MiB

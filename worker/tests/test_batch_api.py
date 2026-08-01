@@ -14,6 +14,12 @@ from PIL import Image
 from imageforge_worker.inference import FakeInferenceAdapter
 
 
+def _encoded_image(image_format: str, size: tuple[int, int], color: str) -> str:
+    payload = io.BytesIO()
+    Image.new("RGB", size, color).save(payload, format=image_format)
+    return payload.getvalue().hex()
+
+
 @pytest.mark.anyio
 async def test_ordered_artifacts_checksums_receipts_and_owner_isolation(
     tmp_path: Path,
@@ -97,6 +103,84 @@ async def test_ordered_artifacts_checksums_receipts_and_owner_isolation(
         assert [item["sha256"] for item in duplicate_manifest["images"]] == [
             item["sha256"] for item in manifest["images"]
         ]
+
+
+@pytest.mark.anyio
+async def test_batch_references_are_decoded_forwarded_and_persisted_without_raw_bytes(
+    tmp_path: Path,
+) -> None:
+    adapter = FakeInferenceAdapter()
+    first_data = _encoded_image("PNG", (32, 24), "red")
+    second_data = _encoded_image("JPEG", (48, 36), "blue")
+    async with worker_client(tmp_path / "volume", adapter) as (client, _, _):
+        created = await client.post(
+            "/v1/batches",
+            headers=auth(),
+            json={
+                "prompts": ["reference guided frame"],
+                "references": [
+                    {"name": "subject.png", "mime_type": "image/png", "data_hex": first_data},
+                    {"name": "palette.jpg", "mime_type": "image/jpeg", "data_hex": second_data},
+                ],
+            },
+        )
+        assert created.status_code == 201, created.text
+        manifest = await wait_for_batch(client, created.json()["batch_id"], state="completed")
+        assert manifest["references"] == [
+            {
+                "name": "subject.png",
+                "mime_type": "image/png",
+                "size_bytes": len(bytes.fromhex(first_data)),
+                "sha256": hashlib.sha256(bytes.fromhex(first_data)).hexdigest(),
+                "filename": "references/000001.png",
+            },
+            {
+                "name": "palette.jpg",
+                "mime_type": "image/jpeg",
+                "size_bytes": len(bytes.fromhex(second_data)),
+                "sha256": hashlib.sha256(bytes.fromhex(second_data)).hexdigest(),
+                "filename": "references/000002.jpg",
+            },
+        ]
+        assert first_data not in created.text
+        assert second_data not in created.text
+        assert adapter.reference_sizes_by_index[1] == ((32, 24), (48, 36))
+        batch_id = created.json()["batch_id"]
+        reference_path = tmp_path / "volume" / "batches" / batch_id / "references" / "000001.png"
+        assert reference_path.read_bytes() == bytes.fromhex(first_data)
+
+
+@pytest.mark.anyio
+async def test_batch_reference_validation_rejects_mismatch_and_non_images(tmp_path: Path) -> None:
+    async with worker_client(tmp_path / "volume") as (client, _, _):
+        malformed = await client.post(
+            "/v1/batches",
+            headers=auth(),
+            json={
+                "prompts": ["safe"],
+                "references": [{"name": "bad.png", "mime_type": "image/png", "data_hex": "00"}],
+            },
+        )
+        assert malformed.status_code == 422
+        assert malformed.json()["error"]["code"] == "reference_invalid"
+        assert "00" not in malformed.text
+
+        mismatched = await client.post(
+            "/v1/batches",
+            headers=auth(),
+            json={
+                "prompts": ["safe"],
+                "references": [
+                    {
+                        "name": "wrong-type.png",
+                        "mime_type": "image/png",
+                        "data_hex": _encoded_image("JPEG", (8, 8), "green"),
+                    }
+                ],
+            },
+        )
+        assert mismatched.status_code == 422
+        assert mismatched.json()["error"]["code"] == "reference_invalid"
 
 
 @pytest.mark.anyio

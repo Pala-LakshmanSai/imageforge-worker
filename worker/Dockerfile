@@ -38,6 +38,7 @@ RUN apt-get update \
       libglib2.0-0 \
       libgl1 \
       libnuma1 \
+      gcc \
     && rm -rf /var/lib/apt/lists/* \
     && python --version | grep -Eq '^Python 3\.11\.' \
     && python -m pip install --no-cache-dir --no-deps \

@@ -9,7 +9,6 @@ harness records evidence and fails closed on any unexpected mutation/queue.
 
 from __future__ import annotations
 
-import argparse
 import asyncio
 import json
 import os
@@ -63,11 +62,25 @@ async def request(
     return response.status_code, body
 
 
-async def contention(client: httpx.AsyncClient, a: tuple[str, str], b: tuple[str, str]) -> dict[str, Any]:
+async def contention(
+    client: httpx.AsyncClient, a: tuple[str, str], b: tuple[str, str]
+) -> dict[str, Any]:
+    prompt_count_raw = os.environ.get("IMAGEFORGE_GATE_PROMPT_COUNT", "1").strip()
+    try:
+        prompt_count = int(prompt_count_raw)
+    except ValueError as exc:
+        raise RuntimeError("IMAGEFORGE_GATE_PROMPT_COUNT must be a positive integer") from exc
+    if prompt_count < 1 or prompt_count > 2000:
+        raise RuntimeError("IMAGEFORGE_GATE_PROMPT_COUNT must be between 1 and 2000")
     prompt = f"ImageForge isolated volume gate {uuid.uuid4()}"
+    prompts = [f"{prompt} frame {index}" for index in range(1, prompt_count + 1)]
     results = await asyncio.gather(
-        request(client, a[0], a[1], "POST", "/v1/batches", {"prompts": [prompt], "base_seed": 41000}),
-        request(client, b[0], b[1], "POST", "/v1/batches", {"prompts": [prompt], "base_seed": 41000}),
+        request(
+            client, a[0], a[1], "POST", "/v1/batches", {"prompts": prompts, "base_seed": 41000}
+        ),
+        request(
+            client, b[0], b[1], "POST", "/v1/batches", {"prompts": prompts, "base_seed": 41000}
+        ),
     )
     statuses = sorted(item[0] for item in results)
     if statuses != [201, 423]:
@@ -84,16 +97,33 @@ async def contention(client: httpx.AsyncClient, a: tuple[str, str], b: tuple[str
 
     winner_client = (a, b)[winner]
     observer_client = (a, b)[loser]
-    status_code, status_body = await request(client, observer_client[0], observer_client[1], "GET", "/v1/status")
-    if status_code != 200 or not isinstance(status_body, dict) or status_body.get("active_batch", {}).get("batch_id") != batch_id:
+    status_code, status_body = await request(
+        client, observer_client[0], observer_client[1], "GET", "/v1/status"
+    )
+    observed_active = status_body.get("active_batch") if isinstance(status_body, dict) else None
+    if (
+        status_code != 200
+        or not isinstance(observed_active, dict)
+        or observed_active.get("batch_id") != batch_id
+    ):
         raise RuntimeError("Observer did not see the one authoritative active batch")
-    mutation_code, _ = await request(client, observer_client[0], observer_client[1], "POST", f"/v1/batches/{batch_id}/pause")
+    mutation_code, _ = await request(
+        client, observer_client[0], observer_client[1], "POST", f"/v1/batches/{batch_id}/pause"
+    )
     if mutation_code != 423:
         raise RuntimeError(f"Observer mutation was not blocked with HTTP 423: {mutation_code}")
     return {
         "winner": "A" if winner == 0 else "B",
         "observer": "A" if loser == 0 else "B",
         "batch_id": batch_id,
+        "prompt_count": prompt_count,
+        "winner_create_status": results[winner][0],
+        "observer_create_status": results[loser][0],
+        "observer_create_error_code": (
+            loser_body.get("error", {}).get("code") if isinstance(loser_body, dict) else None
+        ),
+        "observer_status_code": status_code,
+        "observer_mutation_status": mutation_code,
         "winner_endpoint": winner_client[0],
         "observer_endpoint": observer_client[0],
     }
@@ -134,15 +164,28 @@ async def verify_identity(
         raise RuntimeError(f"Worker {label} reported an unexpected model")
 
 
-async def observe_recovery(client: httpx.AsyncClient, endpoint_pair: tuple[str, str], batch_id: str) -> dict[str, Any]:
-    deadline = time.monotonic() + float(os.environ.get("IMAGEFORGE_GATE_RECOVERY_TIMEOUT_SECONDS", "600"))
+async def observe_recovery(
+    client: httpx.AsyncClient, endpoint_pair: tuple[str, str], batch_id: str
+) -> dict[str, Any]:
+    deadline = time.monotonic() + float(
+        os.environ.get("IMAGEFORGE_GATE_RECOVERY_TIMEOUT_SECONDS", "600")
+    )
     samples: list[dict[str, Any]] = []
     while time.monotonic() < deadline:
-        status_code, body = await request(client, endpoint_pair[0], endpoint_pair[1], "GET", "/v1/status")
-        samples.append({"status": status_code, "active_batch": body.get("active_batch") if isinstance(body, dict) else None})
-        if status_code == 200 and isinstance(body, dict) and body.get("active_batch", {}).get("batch_id") == batch_id:
-            manifest_code, manifest = await request(client, endpoint_pair[0], endpoint_pair[1], "GET", f"/v1/batches/{batch_id}")
-            if manifest_code == 200 and isinstance(manifest, dict) and manifest.get("state") in {"interrupted", "completed", "failed", "cancelled"}:
+        status_code, body = await request(
+            client, endpoint_pair[0], endpoint_pair[1], "GET", "/v1/status"
+        )
+        active_batch = body.get("active_batch") if isinstance(body, dict) else None
+        samples.append({"status": status_code, "active_batch": active_batch})
+        if status_code == 200 and isinstance(body, dict):
+            manifest_code, manifest = await request(
+                client, endpoint_pair[0], endpoint_pair[1], "GET", f"/v1/batches/{batch_id}"
+            )
+            if (
+                manifest_code == 200
+                and isinstance(manifest, dict)
+                and manifest.get("state") in {"interrupted", "completed", "failed", "cancelled"}
+            ):
                 return {"batch_id": batch_id, "manifest": manifest, "samples": samples}
         await asyncio.sleep(2)
     raise TimeoutError("Survivor did not recover the gate batch before the deadline")
@@ -179,7 +222,9 @@ async def main() -> None:
                 raise SystemExit("IMAGEFORGE_GATE_SURVIVOR must be A or B")
             owner = env("IMAGEFORGE_GATE_OWNER").upper()
             if owner not in {"A", "B"}:
-                raise SystemExit("IMAGEFORGE_GATE_OWNER must be A or B and identify the original winner")
+                raise SystemExit(
+                    "IMAGEFORGE_GATE_OWNER must be A or B and identify the original winner"
+                )
             survivor_pair = (a, b)[0 if survivor == "A" else 1]
             owner_pair = (a, b)[0 if owner == "A" else 1]
             await verify_identity(
@@ -197,14 +242,43 @@ async def main() -> None:
             evidence["recovery"] = await observe_recovery(client, recovery_endpoint, batch_id)
         else:
             await asyncio.gather(
-                verify_identity(client, "A", a, evidence["pod_ids"]["A"], evidence["volume_id"], expected_root, evidence["image_digest"], evidence["region"]),
-                verify_identity(client, "B", b, evidence["pod_ids"]["B"], evidence["volume_id"], expected_root, evidence["image_digest"], evidence["region"]),
+                verify_identity(
+                    client,
+                    "A",
+                    a,
+                    evidence["pod_ids"]["A"],
+                    evidence["volume_id"],
+                    expected_root,
+                    evidence["image_digest"],
+                    evidence["region"],
+                ),
+                verify_identity(
+                    client,
+                    "B",
+                    b,
+                    evidence["pod_ids"]["B"],
+                    evidence["volume_id"],
+                    expected_root,
+                    evidence["image_digest"],
+                    evidence["region"],
+                ),
             )
             evidence["contention"] = await contention(client, a, b)
-            evidence["operator_instruction"] = "Stop the recorded winner Pod, then rerun with IMAGEFORGE_GATE_SURVIVOR=<live role>, IMAGEFORGE_GATE_OWNER=<original winner role>, and IMAGEFORGE_GATE_BATCH_ID=<recorded batch_id>."
+            evidence["operator_instruction"] = (
+                "Stop the recorded winner Pod, then rerun with "
+                "IMAGEFORGE_GATE_SURVIVOR=<live role>, "
+                "IMAGEFORGE_GATE_OWNER=<original winner role>, and "
+                "IMAGEFORGE_GATE_BATCH_ID=<recorded batch_id>."
+            )
     evidence["finished_at_unix"] = time.time()
-    output = Path(os.environ.get("IMAGEFORGE_GATE_EVIDENCE", f"imageforge-volume-gate-{run_id}.json"))
-    output.write_text(json.dumps(evidence, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    output = Path(
+        os.environ.get("IMAGEFORGE_GATE_EVIDENCE", f"imageforge-volume-gate-{run_id}.json")
+    )
+    await asyncio.to_thread(
+        output.write_text,
+        json.dumps(evidence, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
     print(json.dumps({"ok": True, "evidence": str(output), "run_id": run_id}, indent=2))
 
 

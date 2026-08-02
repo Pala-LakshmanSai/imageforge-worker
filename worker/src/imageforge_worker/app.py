@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
+import os
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -17,7 +18,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from .auth import BearerAuthenticator, Principal
 from .config import WorkerSettings
-from .constants import API_SCHEMA_VERSION, MAX_PROMPTS, WORKER_VERSION
+from .constants import API_SCHEMA_VERSION, WORKER_VERSION
 from .controller import ArtifactDescriptor, GenerationController
 from .domain import (
     BatchManifest,
@@ -42,7 +43,7 @@ async def _authenticated_principal(request: Request) -> Principal:
 
 PrincipalDependency = Annotated[Principal, Depends(_authenticated_principal)]
 BatchId = Annotated[UUID, PathParameter(description="Server-generated batch UUID")]
-ImageIndex = Annotated[int, PathParameter(ge=1, le=MAX_PROMPTS)]
+ImageIndex = Annotated[int, PathParameter(ge=1)]
 
 
 @dataclass(slots=True)
@@ -124,7 +125,18 @@ async def _boot(runtime: WorkerRuntime) -> None:
         raise
     except Exception as exc:
         error_id = uuid.uuid4().hex
-        logger.error("worker boot failed error_id=%s error_type=%s", error_id, type(exc).__name__)
+        # Keep the public health response deliberately opaque, but allow an
+        # explicitly enabled one-time diagnostic Pod to expose the sanitized
+        # exception text in its private container log for release debugging.
+        diagnostic_message = "<redacted>"
+        if os.environ.get("IMAGEFORGE_BOOT_DIAGNOSTICS") == "1":
+            diagnostic_message = " ".join(str(exc).split())[:240]
+        logger.error(
+            "worker boot failed error_id=%s error_type=%s error_message=%s",
+            error_id,
+            type(exc).__name__,
+            diagnostic_message,
+        )
         await runtime.controller.release_lease_after_boot_failure()
         await runtime.health.fail(error_id)
 

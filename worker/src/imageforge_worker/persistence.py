@@ -13,7 +13,14 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Protocol
 
-from .domain import LOCK_HOLDING_STATES, BatchManifest, ImageRecord, ImageState
+from .domain import (
+    LOCK_HOLDING_STATES,
+    SUCCESS_STATES,
+    BatchManifest,
+    BatchState,
+    ImageRecord,
+    ImageState,
+)
 
 MINIMUM_RETENTION = timedelta(hours=24)
 
@@ -45,7 +52,9 @@ class ManifestStore(Protocol):
 
     def list_batch_ids(self) -> list[str]: ...
 
-    def create(self, manifest: BatchManifest) -> None: ...
+    def create(
+        self, manifest: BatchManifest, reference_payloads: list[tuple[str, bytes]] | None = None
+    ) -> None: ...
 
     def load(self, batch_id: str) -> BatchManifest: ...
 
@@ -56,6 +65,8 @@ class ManifestStore(Protocol):
     ) -> tuple[str, str]: ...
 
     def artifact_path(self, batch_id: str, relative_name: str) -> Path: ...
+
+    def read_reference(self, batch_id: str, relative_name: str) -> bytes: ...
 
     def verify_record_artifacts(self, batch_id: str, record: ImageRecord) -> bool: ...
 
@@ -175,13 +186,23 @@ class FileManifestStore:
                 continue
         return sorted(result)
 
-    def create(self, manifest: BatchManifest) -> None:
+    def create(
+        self, manifest: BatchManifest, reference_payloads: list[tuple[str, bytes]] | None = None
+    ) -> None:
         self._require_active_lease()
         batch_dir = self._batch_dir(manifest.batch_id)
         batch_dir.mkdir(mode=0o700, parents=False, exist_ok=False)
         (batch_dir / "artifacts").mkdir(mode=0o700)
         (batch_dir / "previews").mkdir(mode=0o700)
+        references_dir = batch_dir / "references"
+        references_dir.mkdir(mode=0o700)
         (batch_dir / "quarantine").mkdir(mode=0o700)
+        for relative_name, payload in reference_payloads or []:
+            path = self.artifact_path(manifest.batch_id, relative_name)
+            if not relative_name.startswith("references/"):
+                raise ValueError("reference path must remain under the references directory")
+            self._write_immutable(path, payload)
+        self._fsync_directory(references_dir)
         self._fsync_directory(self.batches_root)
         self.save(manifest)
 
@@ -223,6 +244,12 @@ class FileManifestStore:
         if not candidate.is_relative_to(batch_dir):
             raise ValueError("artifact path escaped its batch directory")
         return candidate
+
+    def read_reference(self, batch_id: str, relative_name: str) -> bytes:
+        if not relative_name.startswith("references/"):
+            raise ValueError("reference path must remain under the references directory")
+        path = self.artifact_path(batch_id, relative_name)
+        return path.read_bytes()
 
     def verify_record_artifacts(self, batch_id: str, record: ImageRecord) -> bool:
         if not all(
@@ -328,6 +355,26 @@ class FileManifestStore:
                 # restart preserve metadata, and the next explicit run saves completion.
                 self.save(manifest)
                 images_deleted += 1
+            # Reference inputs are batch-scoped working data. Once a batch is
+            # fully completed they are no longer needed for resume/retry, so
+            # remove the raw files while retaining checksums and names in the
+            # manifest for reproducibility. Interrupted/failed batches keep
+            # references because they may still be resumed or retried.
+            if (
+                manifest.state == BatchState.COMPLETED
+                and manifest.references
+                and all(image.status in SUCCESS_STATES for image in manifest.images)
+            ):
+                for reference in manifest.references:
+                    path = self.artifact_path(batch_id, reference.filename)
+                    try:
+                        size = path.stat().st_size
+                    except FileNotFoundError:
+                        continue
+                    path.unlink()
+                    self._fsync_directory(path.parent)
+                    files_deleted += 1
+                    bytes_deleted += size
         return CleanupResult(
             images_deleted=images_deleted,
             files_deleted=files_deleted,

@@ -6,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from PIL import Image
 
 from imageforge_worker.constants import (
     MIN_CUDA_VERSION,
@@ -16,6 +17,8 @@ from imageforge_worker.constants import (
     MODEL_REVISION,
     REQUIRED_MODEL_FILES,
 )
+from imageforge_worker.domain import GenerationSettings
+from imageforge_worker.inference.base import GenerationJob
 from imageforge_worker.inference.flux import FluxInferenceAdapter
 from imageforge_worker.prepare_model import main as prepare_model_main
 
@@ -218,6 +221,56 @@ def test_model_snapshot_resolution_is_pinned_and_offline(
     assert MIN_GPU_MEMORY_BYTES == 16_380 * 1024**2
     assert 16 * 1024**3 - MIN_GPU_MEMORY_BYTES == 4 * 1024**2
     assert MIN_CUDA_VERSION == (13, 0)
+
+
+def test_flux_generation_passes_ordered_references_only_when_present(
+    tmp_path: Path,
+) -> None:
+    class FakeCudaRuntime:
+        def synchronize(self) -> None:
+            return None
+
+    class FakeTorch:
+        cuda = FakeCudaRuntime()
+
+        @staticmethod
+        def Generator(*, device: str) -> SimpleNamespace:
+            return SimpleNamespace(device=device, manual_seed=lambda seed: seed)
+
+        @staticmethod
+        def inference_mode():
+            from contextlib import nullcontext
+
+            return nullcontext()
+
+    calls: list[dict[str, object]] = []
+
+    def pipeline(**kwargs: object) -> SimpleNamespace:
+        calls.append(kwargs)
+        return SimpleNamespace(images=[Image.new("RGB", (1280, 720), "black")])
+
+    adapter = FluxInferenceAdapter(tmp_path)
+    adapter._torch = FakeTorch()
+    adapter._pipeline = pipeline
+    settings = GenerationSettings()
+    text_only = GenerationJob(index=1, prompt="text only", seed=7, settings=settings)
+    adapter._generate_sync(text_only)
+    assert "image" not in calls[-1]
+    references = (
+        Image.new("RGB", (16, 12), "red"),
+        Image.new("RGB", (8, 6), "blue"),
+    )
+    guided = GenerationJob(
+        index=2,
+        prompt="guided frame",
+        seed=8,
+        settings=settings,
+        references=references,
+    )
+    adapter._generate_sync(guided)
+    assert calls[-1]["image"] == list(references)
+    assert calls[-1]["prompt"] == "guided frame"
+    assert calls[-1]["generator"] == 8
 
 
 def test_confirmed_model_preparation_narrowly_enables_hub_downloads(

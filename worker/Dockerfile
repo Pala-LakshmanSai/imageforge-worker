@@ -7,7 +7,7 @@
 FROM python:3.11-slim-bookworm@sha256:28255a3ace7eb4c48bc1b57b90af29e1bc82b4fd6c60614a8e3dce61b87ff941
 
 LABEL org.opencontainers.image.title="ImageForge Worker" \
-      org.opencontainers.image.version="0.1.0" \
+      org.opencontainers.image.version="0.1.2" \
       ai.imageforge.api-schema="1" \
       ai.imageforge.cuda-min="13.0" \
       ai.imageforge.python="3.11" \
@@ -38,6 +38,8 @@ RUN apt-get update \
       libglib2.0-0 \
       libgl1 \
       libnuma1 \
+      gcc \
+      libc6-dev \
     && rm -rf /var/lib/apt/lists/* \
     && python --version | grep -Eq '^Python 3\.11\.' \
     && python -m pip install --no-cache-dir --no-deps \

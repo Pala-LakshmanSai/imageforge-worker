@@ -4,6 +4,8 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Protocol
 
+from PIL import Image
+
 from ..domain import GenerationSettings, HealthPhase
 
 PhaseReporter = Callable[[HealthPhase, float], Awaitable[None]]
@@ -15,6 +17,7 @@ class GenerationJob:
     prompt: str
     seed: int
     settings: GenerationSettings
+    references: tuple[Image.Image, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

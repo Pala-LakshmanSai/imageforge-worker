@@ -31,6 +31,8 @@ class FakeInferenceAdapter:
         self.first_generation_started = first_generation_started
         self.release_first_generation = release_first_generation
         self.calls_by_index: dict[int, int] = {}
+        self.references_by_index: dict[int, tuple[Image.Image, ...]] = {}
+        self.reference_sizes_by_index: dict[int, tuple[tuple[int, int], ...]] = {}
         self.generated_indices: list[int] = []
         self.phase_history: list[str] = []
 
@@ -55,6 +57,10 @@ class FakeInferenceAdapter:
             await asyncio.sleep(self.delay_seconds)
         call_count = self.calls_by_index.get(job.index, 0) + 1
         self.calls_by_index[job.index] = call_count
+        self.references_by_index[job.index] = job.references
+        self.reference_sizes_by_index[job.index] = tuple(
+            reference.size for reference in job.references
+        )
         if call_count <= self.failures_before_success.get(job.index, 0):
             raise InferenceFailure("fake_inference_failure")
 

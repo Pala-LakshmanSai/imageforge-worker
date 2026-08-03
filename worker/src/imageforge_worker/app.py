@@ -20,6 +20,15 @@ from .auth import BearerAuthenticator, Principal
 from .config import WorkerSettings
 from .constants import API_SCHEMA_VERSION, WORKER_VERSION
 from .controller import ArtifactDescriptor, GenerationController
+from .coordination import (
+    UUID4_PATTERN,
+    CancelStopRequest,
+    CreateStopRequest,
+    FinalizeStopRequest,
+    HeartbeatRequest,
+    StopResponseRequest,
+    StudioStateResponse,
+)
 from .domain import (
     BatchManifest,
     CreateBatchRequest,
@@ -44,6 +53,15 @@ async def _authenticated_principal(request: Request) -> Principal:
 PrincipalDependency = Annotated[Principal, Depends(_authenticated_principal)]
 BatchId = Annotated[UUID, PathParameter(description="Server-generated batch UUID")]
 ImageIndex = Annotated[int, PathParameter(ge=1)]
+StudioId = Annotated[
+    str,
+    PathParameter(
+        min_length=36,
+        max_length=36,
+        pattern=UUID4_PATTERN.pattern,
+        description="Canonical lowercase UUIDv4",
+    ),
+]
 
 
 @dataclass(slots=True)
@@ -155,6 +173,60 @@ def _install_routes(app: FastAPI, runtime: WorkerRuntime) -> None:
     @app.get("/v1/status", response_model=StatusResponse)
     async def status(principal: PrincipalDependency) -> StatusResponse:
         return await runtime.controller.status(principal, ready=runtime.health.ready)
+
+    @app.put("/v1/studio/sessions/{session_id}", response_model=StudioStateResponse)
+    async def heartbeat_studio_session(
+        principal: PrincipalDependency,
+        session_id: StudioId,
+        request: Annotated[HeartbeatRequest, Body()],
+    ) -> StudioStateResponse:
+        return await runtime.controller.studio_heartbeat(principal, session_id, request)
+
+    @app.get("/v1/studio/sessions/{session_id}", response_model=StudioStateResponse)
+    async def get_studio_state(
+        principal: PrincipalDependency, session_id: StudioId
+    ) -> StudioStateResponse:
+        return await runtime.controller.studio_state(principal, session_id)
+
+    @app.post("/v1/studio/stop-requests", response_model=StudioStateResponse, status_code=201)
+    async def create_gpu_stop_request(
+        principal: PrincipalDependency,
+        request: Annotated[CreateStopRequest, Body()],
+    ) -> StudioStateResponse:
+        return await runtime.controller.request_gpu_stop(principal, request)
+
+    @app.post(
+        "/v1/studio/stop-requests/{request_id}/responses",
+        response_model=StudioStateResponse,
+    )
+    async def respond_to_gpu_stop(
+        principal: PrincipalDependency,
+        request_id: StudioId,
+        request: Annotated[StopResponseRequest, Body()],
+    ) -> StudioStateResponse:
+        return await runtime.controller.respond_to_gpu_stop(principal, request_id, request)
+
+    @app.post(
+        "/v1/studio/stop-requests/{request_id}/finalize",
+        response_model=StudioStateResponse,
+    )
+    async def finalize_gpu_stop(
+        principal: PrincipalDependency,
+        request_id: StudioId,
+        request: Annotated[FinalizeStopRequest, Body()],
+    ) -> StudioStateResponse:
+        return await runtime.controller.finalize_gpu_stop(principal, request_id, request)
+
+    @app.post(
+        "/v1/studio/stop-requests/{request_id}/cancel",
+        response_model=StudioStateResponse,
+    )
+    async def cancel_gpu_stop(
+        principal: PrincipalDependency,
+        request_id: StudioId,
+        request: Annotated[CancelStopRequest, Body()],
+    ) -> StudioStateResponse:
+        return await runtime.controller.cancel_gpu_stop(principal, request_id, request)
 
     @app.post("/v1/batches", response_model=BatchManifest, status_code=201)
     async def create_batch(

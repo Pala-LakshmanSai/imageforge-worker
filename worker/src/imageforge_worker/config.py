@@ -23,8 +23,15 @@ class Credential:
     def __post_init__(self) -> None:
         if not _USER_ID_PATTERN.fullmatch(self.user_id):
             raise ValueError("credential user_id must be a safe 1-64 character identifier")
-        if not self.display_name.strip() or len(self.display_name) > 80:
-            raise ValueError("credential display_name must contain 1-80 characters")
+        if (
+            self.display_name != self.display_name.strip()
+            or not self.display_name
+            or len(self.display_name) > 80
+            or not all(character.isprintable() for character in self.display_name)
+        ):
+            raise ValueError(
+                "credential display_name must contain 1-80 trimmed printable characters"
+            )
         if not 16 <= len(self.token) <= 512 or not BEARER_TOKEN_PATTERN.fullmatch(self.token):
             raise ValueError("worker bearer credentials must be 16-512 ASCII bearer-token chars")
 

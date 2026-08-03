@@ -52,8 +52,8 @@ RUN python -m pip install --no-cache-dir '.[gpu]' \
     && python -m pip check
 
 EXPOSE 8000
-HEALTHCHECK --interval=5s --timeout=3s --start-period=5s --retries=30 \
-  CMD python -c "import json,urllib.request; r=json.load(urllib.request.urlopen('http://127.0.0.1:8000/v1/health', timeout=2)); assert r['process']['status']=='ok'" || exit 1
+HEALTHCHECK --interval=5s --timeout=3s --start-period=300s --retries=60 \
+  CMD python -c "import json,urllib.request; r=json.load(urllib.request.urlopen('http://127.0.0.1:8000/v1/health', timeout=2)); assert r['process']['status']=='ok' and r['phase']=='ready' and r['model']['status']=='ready'" || exit 1
 
 # One Uvicorn process is used per Pod; cross-Pod flock requires the documented
 # paid validation gate for the selected RunPod network-volume configuration.

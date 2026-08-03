@@ -260,8 +260,27 @@ class BatchProgress(StrictModel):
     processed: int = Field(default=0, ge=0)
     current_index: int | None = Field(default=None, ge=1)
 
+    @model_validator(mode="after")
+    def validate_counters(self) -> BatchProgress:
+        if (
+            self.completed > self.total
+            or self.downloaded > self.completed
+            or self.failed > self.total
+            or self.cancelled > self.total
+            or self.processed > self.total
+            or self.completed + self.failed + self.cancelled != self.processed
+            or (self.current_index is not None and self.current_index > self.total)
+        ):
+            raise ValueError("batch progress counters are inconsistent")
+        return self
+
 
 class BatchManifest(StrictModel):
+    # Controllers update image records and then recalculate the aggregate
+    # progress before the next atomic save. Cross-field validation therefore
+    # belongs at construction/load boundaries, not on each in-memory field
+    # mutation during that short transition.
+    model_config = ConfigDict(extra="forbid", strict=True, validate_assignment=False)
     schema_version: Literal[API_SCHEMA_VERSION] = API_SCHEMA_VERSION
     batch_id: str
     owner: BatchOwner
@@ -284,6 +303,22 @@ class BatchManifest(StrictModel):
             raise ValueError("manifest image indices must be contiguous and ordered")
         if self.progress.total != len(self.images):
             raise ValueError("manifest total must match image count")
+        completed = sum(image.status in SUCCESS_STATES for image in self.images)
+        downloaded = sum(image.status == ImageState.DOWNLOADED for image in self.images)
+        failed = sum(image.status == ImageState.FAILED for image in self.images)
+        cancelled = sum(image.status == ImageState.CANCELLED for image in self.images)
+        generating = [image.index for image in self.images if image.status == ImageState.GENERATING]
+        current_index = generating[0] if len(generating) == 1 else None
+        if (
+            self.progress.completed != completed
+            or self.progress.downloaded != downloaded
+            or self.progress.failed != failed
+            or self.progress.cancelled != cancelled
+            or self.progress.processed != completed + failed + cancelled
+            or self.progress.current_index != current_index
+            or len(generating) > 1
+        ):
+            raise ValueError("manifest progress does not match image states")
         return self
 
     def recalculate_progress(self) -> None:

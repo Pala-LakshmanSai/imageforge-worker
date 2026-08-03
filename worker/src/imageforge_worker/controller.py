@@ -7,12 +7,26 @@ import logging
 import secrets
 import uuid
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 
 from PIL import Image
 
 from .auth import Principal
 from .constants import MAX_REFERENCE_PIXELS
+from .coordination import (
+    FINALIZATION_TTL_SECONDS,
+    CancelStopRequest,
+    CoordinationClock,
+    CoordinationIdentity,
+    CreateStopRequest,
+    FinalizeStopRequest,
+    HeartbeatRequest,
+    StopRequestView,
+    StopResponseRequest,
+    StudioCoordinator,
+    StudioStateResponse,
+)
 from .domain import (
     LOCK_HOLDING_STATES,
     NONTERMINAL_IMAGE_STATES,
@@ -38,7 +52,7 @@ from .domain import (
 )
 from .errors import InferenceFailure, WorkerError
 from .inference import GenerationJob, InferenceAdapter, InferenceResult
-from .persistence import ManifestStore
+from .persistence import ManifestStore, SharedGpuStopGuard
 
 logger = logging.getLogger("imageforge_worker.controller")
 
@@ -75,14 +89,23 @@ class GenerationController:
         *,
         max_attempts: int,
         retry_delay_seconds: float,
+        coordination_clock: CoordinationClock | None = None,
+        coordination_finalization_ttl_seconds: int = FINALIZATION_TTL_SECONDS,
     ) -> None:
         self.store = store
         self.inference = inference
         self.max_attempts = max_attempts
         self.retry_delay_seconds = retry_delay_seconds
         self._lock = asyncio.Lock()
+        self.coordination = StudioCoordinator(
+            clock=coordination_clock,
+            finalization_ttl_seconds=coordination_finalization_ttl_seconds,
+        )
         self._active_batch_id: str | None = None
         self._runner_task: asyncio.Task[None] | None = None
+        self._stop_guard: SharedGpuStopGuard | None = None
+        self._stop_guard_is_local = False
+        self._stop_guard_expiry_task: asyncio.Task[None] | None = None
         self._initialized = False
         self._closing = False
 
@@ -101,14 +124,16 @@ class GenerationController:
             try:
                 self.store.initialize()
                 if self.store.try_acquire_active_lease():
+                    self._adopt_or_clear_shared_stop_guard_locked()
                     active = self._discover_active_locked(recover=True)
                     self._active_batch_id = active.batch_id if active is not None else None
-                    if active is None:
+                    if active is None and self._stop_guard is None:
                         self.store.release_active_lease()
                 else:
                     active = self._discover_active_locked(recover=False)
                     self._active_batch_id = active.batch_id if active is not None else None
             except BaseException:
+                self._abandon_stop_guard_locked()
                 self.store.release_active_lease()
                 self.store.release_worker_presence()
                 raise
@@ -157,11 +182,19 @@ class GenerationController:
 
     async def shutdown(self) -> None:
         self._closing = True
-        task = self._runner_task
-        if task is not None and not task.done():
-            task.cancel()
+        runner_task = self._runner_task
+        if runner_task is not None and not runner_task.done():
+            runner_task.cancel()
             try:
-                await task
+                await runner_task
+            except asyncio.CancelledError:
+                pass
+        guard_task = self._stop_guard_expiry_task
+        self._stop_guard_expiry_task = None
+        if guard_task is not None and not guard_task.done():
+            guard_task.cancel()
+            try:
+                await guard_task
             except asyncio.CancelledError:
                 pass
         async with self._lock:
@@ -183,17 +216,27 @@ class GenerationController:
             finally:
                 self.store.release_active_lease()
                 self.store.release_worker_presence()
+                self._stop_guard = None
+                self._stop_guard_is_local = False
 
     async def release_lease_after_boot_failure(self) -> None:
         """Allow a healthy replacement Pod to adopt an interrupted batch."""
 
         async with self._lock:
+            task = self._stop_guard_expiry_task
+            self._stop_guard_expiry_task = None
+            if task is not None and not task.done():
+                task.cancel()
             self.store.release_active_lease()
+            self._stop_guard = None
+            self._stop_guard_is_local = False
 
     async def status(self, principal: Principal, *, ready: bool) -> StatusResponse:
         self._ensure_initialized()
         async with self._lock:
+            self._reconcile_stop_guard_locked()
             active = self._refresh_active_observation_locked()
+            shared_stop_guard = self._stop_guard or self.store.read_gpu_stop_guard()
             is_owner = active is not None and active.owner.user_id == principal.user_id
             summary = (
                 BatchSummary(
@@ -211,11 +254,135 @@ class GenerationController:
                 ready=ready,
                 active_batch=summary,
                 permissions=StatusPermissions(
-                    can_create=ready and active is None,
+                    can_create=ready and active is None and shared_stop_guard is None,
                     can_manage_active=is_owner and self.store.active_lease_held,
                     is_owner=is_owner,
                 ),
             )
+
+    async def studio_heartbeat(
+        self,
+        principal: Principal,
+        session_id: str,
+        request: HeartbeatRequest,
+    ) -> StudioStateResponse:
+        self._ensure_initialized()
+        async with self._lock:
+            self._reconcile_stop_guard_locked()
+            active = self._refresh_active_observation_locked()
+            response = self.coordination.heartbeat(principal, session_id, request, active)
+            self._reconcile_stop_guard_locked()
+            return self._project_shared_stop_guard_locked(response)
+
+    async def studio_state(
+        self, principal: Principal, session_id: str
+    ) -> StudioStateResponse:
+        self._ensure_initialized()
+        async with self._lock:
+            self._reconcile_stop_guard_locked()
+            active = self._refresh_active_observation_locked()
+            response = self.coordination.state(principal, session_id, active)
+            self._reconcile_stop_guard_locked()
+            return self._project_shared_stop_guard_locked(response)
+
+    async def request_gpu_stop(
+        self, principal: Principal, request: CreateStopRequest
+    ) -> StudioStateResponse:
+        self._ensure_initialized()
+        async with self._lock:
+            self._reconcile_stop_guard_locked()
+            if self._stop_guard is not None:
+                self._raise_gpu_stop_pending(self._stop_guard)
+            self._raise_shared_stop_guard_if_present()
+            active = self._refresh_active_observation_locked()
+            response = self.coordination.create_stop_request(principal, request, active)
+            self._reconcile_stop_guard_locked()
+            return response
+
+    async def respond_to_gpu_stop(
+        self,
+        principal: Principal,
+        request_id: str,
+        request: StopResponseRequest,
+    ) -> StudioStateResponse:
+        self._ensure_initialized()
+        async with self._lock:
+            self._reconcile_stop_guard_locked()
+            active = self._refresh_active_observation_locked()
+            response = self.coordination.respond(principal, request_id, request, active)
+            self._reconcile_stop_guard_locked()
+            return response
+
+    async def finalize_gpu_stop(
+        self,
+        principal: Principal,
+        request_id: str,
+        request: FinalizeStopRequest,
+    ) -> StudioStateResponse:
+        self._ensure_initialized()
+        async with self._lock:
+            self._reconcile_stop_guard_locked()
+            active = self._refresh_active_observation_locked()
+            response = self.coordination.finalize(principal, request_id, request, active)
+            if self._stop_guard is not None:
+                if self._stop_guard_is_local:
+                    return response
+                self.coordination.rollback_finalization(request_id, request.finalization_id)
+                self._raise_gpu_stop_pending(self._stop_guard)
+
+            try:
+                self._acquire_stop_guard_lease_locked()
+            except WorkerError as exc:
+                self.coordination.rollback_finalization(
+                    request_id,
+                    request.finalization_id,
+                    generation_started=exc.code == "stop_blocked_by_active_batch",
+                )
+                raise
+
+            stop = response.stop_request
+            if stop is None or stop.finalization_expires_at is None:
+                self.coordination.rollback_finalization(request_id, request.finalization_id)
+                self.store.release_active_lease()
+                raise RuntimeError("finalized GPU Stop response omitted its shared guard")
+            guard = SharedGpuStopGuard(
+                server_instance_id=response.server_instance_id,
+                request_id=request_id,
+                finalization_id=request.finalization_id,
+                pod_id=stop.pod_id,
+                gpu_display_name=stop.gpu_display_name,
+                requester=stop.requester.display_name,
+                requested_at=stop.requested_at,
+                response_deadline=stop.response_deadline,
+                expires_at=stop.finalization_expires_at,
+            )
+            try:
+                self.store.write_gpu_stop_guard(guard)
+            except BaseException:
+                self.coordination.rollback_finalization(request_id, request.finalization_id)
+                try:
+                    self.store.clear_stale_gpu_stop_guard()
+                finally:
+                    self.store.release_active_lease()
+                raise
+            self._stop_guard = guard
+            self._stop_guard_is_local = True
+            self._schedule_stop_guard_expiry_locked(guard)
+            return response
+
+    async def cancel_gpu_stop(
+        self,
+        principal: Principal,
+        request_id: str,
+        request: CancelStopRequest,
+    ) -> StudioStateResponse:
+        self._ensure_initialized()
+        async with self._lock:
+            self._reconcile_stop_guard_locked()
+            active = self._refresh_active_observation_locked()
+            response = self.coordination.cancel(principal, request_id, request, active)
+            self._reconcile_stop_guard_locked()
+            return response
 
     async def create_batch(
         self, principal: Principal, request: CreateBatchRequest
@@ -227,6 +394,11 @@ class GenerationController:
             active = self._refresh_active_observation_locked()
             if active is not None:
                 self._raise_busy(active)
+            try:
+                self._admit_generation_locked()
+            except BaseException:
+                self._release_if_no_active_locked()
+                raise
             now = utc_now()
             batch_id = str(uuid.uuid4())
             images = [
@@ -305,6 +477,7 @@ class GenerationController:
                 active = self._refresh_active_observation_locked()
                 if active is not None:
                     self._raise_busy(active)
+            self._admit_generation_locked()
             for image in manifest.images:
                 if image.status in {ImageState.GENERATING, ImageState.RETRYING}:
                     self.store.quarantine_artifacts(batch_id, image.index)
@@ -380,6 +553,11 @@ class GenerationController:
                     code="no_failed_images",
                     message="This batch has no failed images to retry.",
                 )
+            try:
+                self._admit_generation_locked()
+            except BaseException:
+                self._release_if_no_active_locked()
+                raise
             for image in failed:
                 image.status = ImageState.PENDING
                 image.error = None
@@ -702,6 +880,219 @@ class GenerationController:
         if self._runner_task is task:
             self._runner_task = None
 
+    def _admit_generation_locked(self) -> None:
+        self._reconcile_stop_guard_locked(release_lease=False)
+        if self._stop_guard is not None:
+            self._raise_gpu_stop_pending(self._stop_guard)
+        self.coordination.admit_generation()
+
+    def _acquire_stop_guard_lease_locked(self) -> None:
+        if self.store.active_lease_held:
+            active = self._refresh_active_observation_locked()
+            if active is not None:
+                self._raise_stop_blocked_by_active_batch(active)
+            adopted = self._adopt_or_clear_shared_stop_guard_locked()
+            if adopted is not None:
+                self._raise_gpu_stop_pending(adopted)
+            return
+
+        if not self.store.try_acquire_active_lease():
+            self._raise_shared_stop_guard_if_present()
+            active = self._discover_active_locked(recover=False)
+            self._active_batch_id = active.batch_id if active is not None else None
+            if active is not None:
+                self._raise_stop_blocked_by_active_batch(active)
+            raise WorkerError(
+                status_code=423,
+                code="worker_volume_locked",
+                message="Another worker process is updating the shared volume.",
+            )
+
+        try:
+            adopted = self._adopt_or_clear_shared_stop_guard_locked()
+            if adopted is not None:
+                self._raise_gpu_stop_pending(adopted)
+            active = self._discover_active_locked(recover=True)
+        except WorkerError:
+            # An adopted guard intentionally keeps the lease until its expiry.
+            raise
+        except BaseException:
+            self._abandon_stop_guard_locked()
+            self.store.release_active_lease()
+            raise
+        self._active_batch_id = active.batch_id if active is not None else None
+        if active is not None:
+            # Recovery owns the batch lease now. Retain it while returning the
+            # unconditional active-batch Stop veto.
+            self._raise_stop_blocked_by_active_batch(active)
+
+    def _adopt_or_clear_shared_stop_guard_locked(
+        self,
+    ) -> SharedGpuStopGuard | None:
+        guard = self.store.read_gpu_stop_guard()
+        if guard is not None and (
+            0 < self._shared_guard_remaining_seconds(guard) <= FINALIZATION_TTL_SECONDS
+        ):
+            self._stop_guard = guard
+            self._stop_guard_is_local = False
+            self._schedule_stop_guard_expiry_locked(guard)
+            return guard
+        # A released lease proves there is no live owner. Only its new owner
+        # may remove expired, malformed, or partial crash residue.
+        self.store.clear_stale_gpu_stop_guard()
+        return None
+
+    def _reconcile_stop_guard_locked(self, *, release_lease: bool = True) -> None:
+        guard = self._stop_guard
+        if guard is None:
+            return
+        remaining = self._stop_guard_remaining_seconds(guard)
+        if remaining is None or remaining <= 0:
+            self._clear_stop_guard_locked(release_lease=release_lease)
+
+    def _project_shared_stop_guard_locked(
+        self, response: StudioStateResponse
+    ) -> StudioStateResponse:
+        """Expose an adopted guard without reviving its old deletion authority."""
+
+        if response.stop_request is not None:
+            return response
+        guard = self._stop_guard or self.store.read_gpu_stop_guard()
+        if guard is None:
+            return response
+        occupied_session_ids = {session.session_id for session in response.sessions}
+        counter = 0
+        while True:
+            digest = bytearray(
+                hashlib.sha256(
+                    (
+                        "imageforge-orphan-stop\0"
+                        f"{guard.server_instance_id}\0{guard.request_id}\0"
+                        f"{response.server_instance_id}\0{counter}"
+                    ).encode()
+                ).digest()[:16]
+            )
+            digest[6] = (digest[6] & 0x0F) | 0x40
+            digest[8] = (digest[8] & 0x3F) | 0x80
+            synthetic_session_id = str(uuid.UUID(bytes=bytes(digest)))
+            if synthetic_session_id not in occupied_session_ids:
+                break
+            counter += 1
+        return response.model_copy(
+            update={
+                "stop_request": StopRequestView(
+                    request_id=guard.request_id,
+                    pod_id=guard.pod_id,
+                    gpu_display_name=guard.gpu_display_name,
+                    requester=CoordinationIdentity(
+                        session_id=synthetic_session_id,
+                        display_name=guard.requester,
+                    ),
+                    state="finalizing",
+                    reason=None,
+                    requested_at=guard.requested_at,
+                    response_deadline=guard.response_deadline,
+                    finalization_expires_at=guard.expires_at,
+                    waiting_for=[],
+                    approved_by=[],
+                    denied_by=[],
+                    finalization_id=None,
+                )
+            }
+        )
+
+    def _stop_guard_remaining_seconds(
+        self, guard: SharedGpuStopGuard
+    ) -> float | None:
+        if self._stop_guard_is_local:
+            return self.coordination.finalization_remaining_seconds(
+                guard.request_id, guard.finalization_id
+            )
+        return self._shared_guard_remaining_seconds(guard)
+
+    def _shared_guard_remaining_seconds(self, guard: SharedGpuStopGuard) -> float:
+        expires_at = datetime.fromisoformat(guard.expires_at.replace("Z", "+00:00"))
+        now = self.coordination.clock.utcnow().astimezone(UTC)
+        return max(0.0, (expires_at.astimezone(UTC) - now).total_seconds())
+
+    def _clear_stop_guard_locked(self, *, release_lease: bool) -> None:
+        guard = self._stop_guard
+        if guard is None:
+            return
+        self.store.clear_gpu_stop_guard(guard)
+        self._stop_guard = None
+        self._stop_guard_is_local = False
+        task = self._stop_guard_expiry_task
+        self._stop_guard_expiry_task = None
+        if task is not None and task is not asyncio.current_task() and not task.done():
+            task.cancel()
+        if release_lease and self._active_batch_id is None:
+            self.store.release_active_lease()
+
+    def _abandon_stop_guard_locked(self) -> None:
+        """Drop only process-local state when its lease cannot be retained."""
+
+        task = self._stop_guard_expiry_task
+        self._stop_guard_expiry_task = None
+        if task is not None and task is not asyncio.current_task() and not task.done():
+            task.cancel()
+        self._stop_guard = None
+        self._stop_guard_is_local = False
+
+    def _schedule_stop_guard_expiry_locked(self, guard: SharedGpuStopGuard) -> None:
+        prior = self._stop_guard_expiry_task
+        if prior is not None and not prior.done():
+            prior.cancel()
+        self._stop_guard_expiry_task = asyncio.create_task(
+            self._expire_stop_guard(guard),
+            name=f"gpu-stop-guard-{guard.request_id}",
+        )
+
+    async def _expire_stop_guard(self, guard: SharedGpuStopGuard) -> None:
+        delay = self._stop_guard_remaining_seconds(guard)
+        while True:
+            await asyncio.sleep(max(delay or 0.0, 0.01))
+            async with self._lock:
+                if self._stop_guard != guard:
+                    return
+                remaining = self._stop_guard_remaining_seconds(guard)
+                if remaining is None or remaining <= 0:
+                    self._clear_stop_guard_locked(release_lease=True)
+                    return
+                delay = remaining
+
+    def _raise_shared_stop_guard_if_present(self) -> None:
+        guard = self.store.read_gpu_stop_guard()
+        if guard is None:
+            return
+        self._raise_gpu_stop_pending(guard)
+
+    @staticmethod
+    def _raise_gpu_stop_pending(guard: SharedGpuStopGuard) -> None:
+        raise WorkerError(
+            status_code=423,
+            code="gpu_stop_pending",
+            message="GPU Stop is finalizing; new generation is temporarily blocked.",
+            details={
+                "request_id": guard.request_id,
+                "requester": guard.requester,
+                "expires_at": guard.expires_at,
+            },
+        )
+
+    @staticmethod
+    def _raise_stop_blocked_by_active_batch(active: BatchManifest) -> None:
+        raise WorkerError(
+            status_code=423,
+            code="stop_blocked_by_active_batch",
+            message=f"{active.owner.display_name} has an active generation batch.",
+            details={
+                "owner": active.owner.display_name,
+                "completed": active.progress.completed,
+                "total": active.progress.total,
+            },
+        )
+
     def _discover_active_locked(self, *, recover: bool) -> BatchManifest | None:
         active_manifests: list[BatchManifest] = []
         for batch_id in self.store.list_batch_ids():
@@ -730,29 +1121,48 @@ class GenerationController:
                 # same interruption recovery as a freshly booted worker.
                 if self.store.try_acquire_active_lease():
                     try:
+                        self._adopt_or_clear_shared_stop_guard_locked()
                         recovered = self._discover_active_locked(recover=True)
                     except BaseException:
+                        self._abandon_stop_guard_locked()
                         self.store.release_active_lease()
                         raise
                     self._active_batch_id = recovered.batch_id if recovered is not None else None
-                    if recovered is None:
+                    if recovered is None and self._stop_guard is None:
                         self.store.release_active_lease()
                     return recovered
                 return active
         active = self._discover_active_locked(recover=False)
         self._active_batch_id = active.batch_id if active is not None else None
         if (
+            active is None
+            and not self.store.active_lease_held
+            and self.store.read_gpu_stop_guard() is not None
+            and self.store.try_acquire_active_lease()
+        ):
+            try:
+                self._adopt_or_clear_shared_stop_guard_locked()
+            except BaseException:
+                self._abandon_stop_guard_locked()
+                self.store.release_active_lease()
+                raise
+            if self._stop_guard is None:
+                self.store.release_active_lease()
+            return None
+        if (
             active is not None
             and not self.store.active_lease_held
             and self.store.try_acquire_active_lease()
         ):
             try:
+                self._adopt_or_clear_shared_stop_guard_locked()
                 recovered = self._discover_active_locked(recover=True)
             except BaseException:
+                self._abandon_stop_guard_locked()
                 self.store.release_active_lease()
                 raise
             self._active_batch_id = recovered.batch_id if recovered is not None else None
-            if recovered is None:
+            if recovered is None and self._stop_guard is None:
                 self.store.release_active_lease()
             return recovered
         return active
@@ -764,12 +1174,21 @@ class GenerationController:
         while True:
             if self.store.try_acquire_active_lease():
                 try:
+                    adopted = self._adopt_or_clear_shared_stop_guard_locked()
+                    if adopted is not None:
+                        self._raise_gpu_stop_pending(adopted)
                     active = self._discover_active_locked(recover=True)
+                except WorkerError:
+                    # This process adopted the crash-safe guard and must retain
+                    # the shared lease until cancellation or expiry.
+                    raise
                 except BaseException:
+                    self._abandon_stop_guard_locked()
                     self.store.release_active_lease()
                     raise
                 self._active_batch_id = active.batch_id if active is not None else None
                 return
+            self._raise_shared_stop_guard_if_present()
             active = self._discover_active_locked(recover=False)
             self._active_batch_id = active.batch_id if active is not None else None
             if active is not None:
@@ -787,12 +1206,19 @@ class GenerationController:
             return
         if self.store.try_acquire_active_lease():
             try:
+                adopted = self._adopt_or_clear_shared_stop_guard_locked()
+                if adopted is not None:
+                    self._raise_gpu_stop_pending(adopted)
                 active = self._discover_active_locked(recover=True)
+            except WorkerError:
+                raise
             except BaseException:
+                self._abandon_stop_guard_locked()
                 self.store.release_active_lease()
                 raise
             self._active_batch_id = active.batch_id if active is not None else None
             return
+        self._raise_shared_stop_guard_if_present()
         active = self._discover_active_locked(recover=False)
         self._active_batch_id = active.batch_id if active is not None else None
         details = None
@@ -827,9 +1253,12 @@ class GenerationController:
     def _release_batch_lease_locked(self, batch_id: str) -> None:
         if self._active_batch_id == batch_id:
             self._active_batch_id = None
-            self.store.release_active_lease()
+            if self._stop_guard is None:
+                self.store.release_active_lease()
 
     def _release_if_no_active_locked(self) -> None:
+        if self._stop_guard is not None:
+            return
         active = self._refresh_active_observation_locked()
         if active is None:
             self.store.release_active_lease()

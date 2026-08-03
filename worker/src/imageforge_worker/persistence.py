@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import errno
-import fcntl
 import hashlib
 import json
 import os
+import re
 import shutil
 import tempfile
 import uuid
@@ -13,6 +13,12 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Protocol
 
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
+
+from .coordination import FINALIZATION_TTL_SECONDS, STOP_RESPONSE_TTL_SECONDS
 from .domain import (
     LOCK_HOLDING_STATES,
     SUCCESS_STATES,
@@ -23,6 +29,18 @@ from .domain import (
 )
 
 MINIMUM_RETENTION = timedelta(hours=24)
+_WINDOWS_PRESENCE_SLOTS = 256
+_GPU_STOP_GUARD_FILENAME = ".gpu-stop-finalization.json"
+_MAX_GPU_STOP_GUARD_BYTES = 2048
+_POD_ID_PATTERN = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,56}[A-Za-z0-9])?$")
+_GPU_DISPLAY_PATTERN = re.compile(r"^[A-Za-z0-9 ._()+-]{1,80}$")
+
+
+@dataclass(frozen=True, slots=True)
+class _HeldLock:
+    descriptor: int
+    offset: int
+    length: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -30,6 +48,69 @@ class CleanupResult:
     images_deleted: int = 0
     files_deleted: int = 0
     bytes_deleted: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class SharedGpuStopGuard:
+    server_instance_id: str
+    request_id: str
+    finalization_id: str
+    pod_id: str
+    gpu_display_name: str
+    requester: str
+    requested_at: str
+    response_deadline: str
+    expires_at: str
+
+    def __post_init__(self) -> None:
+        for value in (self.server_instance_id, self.request_id, self.finalization_id):
+            try:
+                parsed = uuid.UUID(value)
+            except ValueError as exc:
+                raise ValueError("shared GPU Stop guard IDs must be UUIDv4") from exc
+            if parsed.version != 4 or parsed.variant != uuid.RFC_4122 or str(parsed) != value:
+                raise ValueError("shared GPU Stop guard IDs must be canonical UUIDv4")
+        if (
+            self.requester != self.requester.strip()
+            or not self.requester
+            or len(self.requester) > 80
+            or not all(character.isprintable() for character in self.requester)
+        ):
+            raise ValueError("shared GPU Stop requester must be a safe display name")
+        if _POD_ID_PATTERN.fullmatch(self.pod_id) is None:
+            raise ValueError("shared GPU Stop pod ID is invalid")
+        if (
+            self.gpu_display_name != self.gpu_display_name.strip()
+            or _GPU_DISPLAY_PATTERN.fullmatch(self.gpu_display_name) is None
+        ):
+            raise ValueError("shared GPU Stop GPU display name is invalid")
+        timestamps = [
+            _parse_timestamp(value)
+            for value in (self.requested_at, self.response_deadline, self.expires_at)
+        ]
+        raw_timestamps = (
+            self.requested_at,
+            self.response_deadline,
+            self.expires_at,
+        )
+        if any(value is None for value in timestamps) or any(
+            _format_timestamp(parsed) != raw
+            for parsed, raw in zip(timestamps, raw_timestamps, strict=True)
+            if parsed is not None
+        ):
+            raise ValueError("shared GPU Stop timestamps must be RFC3339 milliseconds")
+        requested_at, response_deadline, expires_at = timestamps
+        assert requested_at is not None
+        assert response_deadline is not None
+        assert expires_at is not None
+        if not requested_at <= response_deadline < expires_at:
+            raise ValueError("shared GPU Stop timestamps are out of order")
+        if response_deadline - requested_at > timedelta(
+            seconds=STOP_RESPONSE_TTL_SECONDS
+        ) or expires_at - response_deadline > timedelta(
+            seconds=FINALIZATION_TTL_SECONDS
+        ):
+            raise ValueError("shared GPU Stop timestamps exceed the safety envelope")
 
 
 class ManifestStore(Protocol):
@@ -49,6 +130,14 @@ class ManifestStore(Protocol):
     def try_acquire_active_lease(self) -> bool: ...
 
     def release_active_lease(self) -> None: ...
+
+    def write_gpu_stop_guard(self, guard: SharedGpuStopGuard) -> None: ...
+
+    def read_gpu_stop_guard(self) -> SharedGpuStopGuard | None: ...
+
+    def clear_gpu_stop_guard(self, expected: SharedGpuStopGuard) -> None: ...
+
+    def clear_stale_gpu_stop_guard(self) -> None: ...
 
     def list_batch_ids(self) -> list[str]: ...
 
@@ -84,9 +173,9 @@ class FileManifestStore:
         self.root = root
         self.batches_root = root / "batches"
         self.fsync_writes = fsync_writes
-        self._worker_presence_descriptor: int | None = None
-        self._maintenance_presence_descriptor: int | None = None
-        self._active_lease_descriptor: int | None = None
+        self._worker_presence_descriptor: _HeldLock | None = None
+        self._maintenance_presence_descriptor: _HeldLock | None = None
+        self._active_lease_descriptor: _HeldLock | None = None
 
     @property
     def active_lease_held(self) -> bool:
@@ -106,7 +195,7 @@ class FileManifestStore:
             return True
         if self._maintenance_presence_descriptor is not None:
             return False
-        descriptor = self._try_acquire_lock(".worker-presence.lock", fcntl.LOCK_SH)
+        descriptor = self._try_acquire_lock(".worker-presence.lock", shared=True)
         if descriptor is None:
             return False
         self._worker_presence_descriptor = descriptor
@@ -124,7 +213,7 @@ class FileManifestStore:
             return True
         if self._worker_presence_descriptor is not None:
             return False
-        descriptor = self._try_acquire_lock(".worker-presence.lock", fcntl.LOCK_EX)
+        descriptor = self._try_acquire_lock(".worker-presence.lock", shared=False)
         if descriptor is None:
             return False
         self._maintenance_presence_descriptor = descriptor
@@ -138,7 +227,7 @@ class FileManifestStore:
     def try_acquire_active_lease(self) -> bool:
         if self._active_lease_descriptor is not None:
             return True
-        descriptor = self._try_acquire_lock(".active-batch.lock", fcntl.LOCK_EX)
+        descriptor = self._try_acquire_lock(".active-batch.lock", shared=False)
         if descriptor is None:
             return False
         self._active_lease_descriptor = descriptor
@@ -149,29 +238,174 @@ class FileManifestStore:
         self._active_lease_descriptor = None
         self._release_lock(descriptor)
 
-    def _try_acquire_lock(self, name: str, operation: int) -> int | None:
+    def write_gpu_stop_guard(self, guard: SharedGpuStopGuard) -> None:
+        """Publish a strict cross-process finalization marker under the active lease."""
+
+        self._require_active_lease()
+        payload = json.dumps(
+            {
+                "schema_version": 2,
+                "server_instance_id": guard.server_instance_id,
+                "request_id": guard.request_id,
+                "finalization_id": guard.finalization_id,
+                "pod_id": guard.pod_id,
+                "gpu_display_name": guard.gpu_display_name,
+                "requester": guard.requester,
+                "requested_at": guard.requested_at,
+                "response_deadline": guard.response_deadline,
+                "expires_at": guard.expires_at,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        self._atomic_write(self.root / _GPU_STOP_GUARD_FILENAME, payload)
+
+    def read_gpu_stop_guard(self) -> SharedGpuStopGuard | None:
+        path = self.root / _GPU_STOP_GUARD_FILENAME
+        try:
+            if path.stat().st_size > _MAX_GPU_STOP_GUARD_BYTES:
+                return None
+            payload = json.loads(path.read_bytes())
+        except (FileNotFoundError, OSError, UnicodeDecodeError, json.JSONDecodeError):
+            return None
+        if not isinstance(payload, dict) or set(payload) != {
+            "schema_version",
+            "server_instance_id",
+            "request_id",
+            "finalization_id",
+            "pod_id",
+            "gpu_display_name",
+            "requester",
+            "requested_at",
+            "response_deadline",
+            "expires_at",
+        }:
+            return None
+        if type(payload["schema_version"]) is not int or payload["schema_version"] != 2:
+            return None
+        values = [
+            payload["server_instance_id"],
+            payload["request_id"],
+            payload["finalization_id"],
+            payload["pod_id"],
+            payload["gpu_display_name"],
+            payload["requester"],
+            payload["requested_at"],
+            payload["response_deadline"],
+            payload["expires_at"],
+        ]
+        if not all(isinstance(value, str) for value in values):
+            return None
+        try:
+            return SharedGpuStopGuard(
+                server_instance_id=payload["server_instance_id"],
+                request_id=payload["request_id"],
+                finalization_id=payload["finalization_id"],
+                pod_id=payload["pod_id"],
+                gpu_display_name=payload["gpu_display_name"],
+                requester=payload["requester"],
+                requested_at=payload["requested_at"],
+                response_deadline=payload["response_deadline"],
+                expires_at=payload["expires_at"],
+            )
+        except ValueError:
+            return None
+
+    def clear_gpu_stop_guard(self, expected: SharedGpuStopGuard) -> None:
+        """Idempotently clear only the marker owned by the exact local guard."""
+
+        self._require_active_lease()
+        path = self.root / _GPU_STOP_GUARD_FILENAME
+        current = self.read_gpu_stop_guard()
+        if current is None:
+            if path.exists():
+                raise RuntimeError("the shared GPU Stop guard marker is invalid")
+            return
+        if current != expected:
+            raise RuntimeError("the shared GPU Stop guard marker belongs to another grant")
+        path.unlink(missing_ok=True)
+        self._fsync_directory(self.root)
+
+    def clear_stale_gpu_stop_guard(self) -> None:
+        """Clear a crashed owner's marker only after acquiring its released lease."""
+
+        self._require_active_lease()
+        path = self.root / _GPU_STOP_GUARD_FILENAME
+        path.unlink(missing_ok=True)
+        self._fsync_directory(self.root)
+
+    def _try_acquire_lock(self, name: str, *, shared: bool) -> _HeldLock | None:
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
         flags = os.O_RDWR | os.O_CREAT
         if hasattr(os, "O_CLOEXEC"):
             flags |= os.O_CLOEXEC
         descriptor = os.open(self.root / name, flags, 0o600)
+        if os.name == "nt":
+            return self._try_acquire_windows_lock(
+                descriptor,
+                shared=shared,
+                presence=name == ".worker-presence.lock",
+            )
         try:
-            fcntl.flock(descriptor, operation | fcntl.LOCK_NB)
+            fcntl.flock(
+                descriptor,
+                (fcntl.LOCK_SH if shared else fcntl.LOCK_EX) | fcntl.LOCK_NB,
+            )
         except OSError as exc:
             os.close(descriptor)
             if exc.errno in {errno.EACCES, errno.EAGAIN}:
                 return None
             raise
-        return descriptor
+        return _HeldLock(descriptor, 0, 0)
 
     @staticmethod
-    def _release_lock(descriptor: int | None) -> None:
-        if descriptor is None:
+    def _try_acquire_windows_lock(
+        descriptor: int,
+        *,
+        shared: bool,
+        presence: bool,
+    ) -> _HeldLock | None:
+        """Use byte-range locks because Windows has no shared flock operation.
+
+        Each worker reserves one byte in the presence file. Maintenance takes the
+        whole 256-byte range, so it cannot start while any worker process is alive.
+        The active-batch file uses the same exclusive range mechanism with one byte.
+        """
+
+        required_size = _WINDOWS_PRESENCE_SLOTS if presence else 1
+        try:
+            if os.fstat(descriptor).st_size < required_size:
+                os.ftruncate(descriptor, required_size)
+            offsets = range(_WINDOWS_PRESENCE_SLOTS) if presence and shared else (0,)
+            length = 1 if presence and shared else required_size
+            for offset in offsets:
+                os.lseek(descriptor, offset, os.SEEK_SET)
+                try:
+                    msvcrt.locking(descriptor, msvcrt.LK_NBLCK, length)
+                except OSError as exc:
+                    if exc.errno in {errno.EACCES, errno.EAGAIN}:
+                        continue
+                    raise
+                return _HeldLock(descriptor, offset, length)
+        except BaseException:
+            os.close(descriptor)
+            raise
+        os.close(descriptor)
+        return None
+
+    @staticmethod
+    def _release_lock(lock: _HeldLock | None) -> None:
+        if lock is None:
             return
         try:
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            if os.name == "nt":
+                os.lseek(lock.descriptor, lock.offset, os.SEEK_SET)
+                msvcrt.locking(lock.descriptor, msvcrt.LK_UNLCK, lock.length)
+            else:
+                fcntl.flock(lock.descriptor, fcntl.LOCK_UN)
         finally:
-            os.close(descriptor)
+            os.close(lock.descriptor)
 
     def list_batch_ids(self) -> list[str]:
         if not self.batches_root.exists():
@@ -454,3 +688,7 @@ def _parse_timestamp(raw: str) -> datetime | None:
     if parsed.tzinfo is None:
         return None
     return parsed.astimezone(UTC)
+
+
+def _format_timestamp(value: datetime) -> str:
+    return value.astimezone(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")

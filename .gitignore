@@ -1,0 +1,12 @@
+# Finder metadata created by macOS on removable volumes.
+._*
+**/._*
+
+# Local Python tooling and test caches.
+.DS_Store
+**/__pycache__/
+**/.pytest_cache/
+**/.ruff_cache/
+**/.venv/
+**/.tmp/
+*.py[cod]

@@ -3,7 +3,8 @@
 This directory contains the Python 3.11/FastAPI worker for one ImageForge GPU.
 It owns exactly one shared-volume POSIX batch lease, generates images sequentially
 on one approved GPU, and stores crash-safe manifests on the RunPod network volume.
-It never creates, stops, or terminates a Pod.
+It also hosts ephemeral authenticated studio presence and Stop-consent state. It
+never creates, stops, or terminates a Pod.
 
 ## Runtime contract
 
@@ -88,6 +89,8 @@ a JSON list shaped as follows (values below are descriptive, not credentials):
 ```
 
 Tokens use the RFC bearer-token ASCII alphabet and are compared in constant time.
+Display names must contain 1-80 trimmed printable characters because they are
+projected into authenticated studio coordination responses.
 Unknown batch IDs and batches owned by a
 different user intentionally return the same `batch_not_found` response. The
 worker does not log authorization headers or prompt content. OpenAPI and docs
@@ -146,6 +149,36 @@ the lease. `retry-failed` reopens only terminally failed images when no other
 batch owns the GPU.
 A duplicate Pod that does not hold the volume lease returns typed `worker_standby`
 for mutation attempts while continuing to expose authorized read-only status.
+
+### Studio coordination
+
+Clients heartbeat `PUT /v1/studio/sessions/{session_id}` with only
+`foreground`/`background` availability and read shared state with `GET` on the
+same path. Presence expires after 15 seconds and is never durable across worker
+restart. Duplicate windows for one authenticated user count as one approval
+participant.
+
+`POST /v1/studio/stop-requests` binds consent to an exact Pod ID. Any active
+batch returns `stop_blocked_by_active_batch`. Otherwise every other live
+foreground user must approve through the response endpoint. Denial, timeout,
+requester expiry, or cancellation keeps compute running. Pending approval never
+blocks generation: valid create/resume/retry wins atomically and cancels the
+request. After approval, the requester may acquire a 60-second finalization
+guard; only that state rejects new generation with `gpu_stop_pending`. The
+desktop cancels the exact guard after a definite provider failure, while expiry
+fails safely. The guard outlives requester heartbeat loss until that expiry so
+an in-flight or ambiguous provider call cannot release generation early. It is
+backed by both the shared-volume active lease and an atomic marker, so every
+worker process observes the same admission block. A replacement process adopts
+an unexpired crash or shutdown marker for its remaining TTL while resetting all
+client sessions and approvals. Full shapes and error codes are in
+`docs/API_CONTRACT.md`.
+
+After that adoption, studio heartbeats expose a read-only synthetic
+`finalizing` request with the exact Pod/GPU/requester/expiry and a null
+`finalization_id`. It informs every client and keeps Generate disabled without
+authorizing any new-epoch session to respond, cancel, finalize, or repeat the
+provider deletion. The synthetic state disappears when the shared guard expires.
 
 ## Retention cleanup
 

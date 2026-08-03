@@ -9,4 +9,8 @@
 **/.ruff_cache/
 **/.venv/
 **/.tmp/
+**/.env
+**/.env.*
+**/artifacts/
+*.part
 *.py[cod]

@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from typing import Annotated, Any
 from uuid import UUID
 
-from fastapi import Body, Depends, FastAPI, Request
+from fastapi import Body, Depends, FastAPI, Query, Request
 from fastapi import Path as PathParameter
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
@@ -38,6 +38,20 @@ from .domain import (
     StatusResponse,
 )
 from .errors import WorkerError
+from .gpu_switch_models import (
+    AdoptGpuSwitchRequestV1,
+    CancelGpuSwitchRequestV1,
+    CompleteGpuSwitchRequestV1,
+    CreateGpuSwitchRequestV1,
+    DeleteIntentGpuSwitchRequestV1,
+    FinalizeGpuSwitchRequestV1,
+    GpuSwitchLookupResponseV1,
+    GpuSwitchResponseRequestV1,
+    NativeWorkerGpuSwitchCreateResponseV1,
+    NativeWorkerGpuSwitchOwnerLookupV1,
+    SettleGpuSwitchCreateRequestV1,
+    WorkerGpuSwitchRuntimeIdentityV1,
+)
 from .health import HealthTracker
 from .inference import FakeInferenceAdapter, FluxInferenceAdapter, InferenceAdapter
 from .persistence import FileManifestStore, ManifestStore
@@ -52,6 +66,15 @@ async def _authenticated_principal(request: Request) -> Principal:
 
 PrincipalDependency = Annotated[Principal, Depends(_authenticated_principal)]
 BatchId = Annotated[UUID, PathParameter(description="Server-generated batch UUID")]
+SubmissionId = Annotated[
+    str,
+    PathParameter(
+        min_length=36,
+        max_length=36,
+        pattern=UUID4_PATTERN.pattern,
+        description="Canonical lowercase UUIDv4 client submission ID",
+    ),
+]
 ImageIndex = Annotated[int, PathParameter(ge=1)]
 StudioId = Annotated[
     str,
@@ -60,6 +83,15 @@ StudioId = Annotated[
         max_length=36,
         pattern=UUID4_PATTERN.pattern,
         description="Canonical lowercase UUIDv4",
+    ),
+]
+StudioSessionQuery = Annotated[
+    str,
+    Query(
+        min_length=36,
+        max_length=36,
+        pattern=UUID4_PATTERN.pattern,
+        description="Canonical lowercase UUIDv4 live Studio session",
     ),
 ]
 
@@ -92,6 +124,8 @@ def create_app(
         selected_inference,
         max_attempts=configured.max_generation_attempts,
         retry_delay_seconds=configured.retry_delay_seconds,
+        runtime_metadata=configured.runtime_metadata,
+        data_root=configured.data_root,
     )
     runtime = WorkerRuntime(
         settings=configured,
@@ -228,13 +262,141 @@ def _install_routes(app: FastAPI, runtime: WorkerRuntime) -> None:
     ) -> StudioStateResponse:
         return await runtime.controller.cancel_gpu_stop(principal, request_id, request)
 
+    @app.get("/v1/studio/gpu-switches/{switch_id}", response_model=GpuSwitchLookupResponseV1)
+    async def get_gpu_switch(
+        principal: PrincipalDependency,
+        switch_id: StudioId,
+        session_id: StudioSessionQuery,
+    ) -> GpuSwitchLookupResponseV1:
+        return await runtime.controller.get_gpu_switch(principal, switch_id, session_id)
+
+    @app.get(
+        "/v1/internal/gpu-switches/{switch_id}/owner",
+        response_model=NativeWorkerGpuSwitchOwnerLookupV1,
+    )
+    async def get_gpu_switch_owner(
+        principal: PrincipalDependency,
+        switch_id: StudioId,
+        session_id: StudioSessionQuery,
+    ) -> NativeWorkerGpuSwitchOwnerLookupV1:
+        return await runtime.controller.get_gpu_switch_owner(principal, switch_id, session_id)
+
+    @app.get(
+        "/v1/internal/gpu-switches/{switch_id}/runtime-identity",
+        response_model=WorkerGpuSwitchRuntimeIdentityV1,
+    )
+    async def get_gpu_switch_runtime_identity(
+        principal: PrincipalDependency,
+        switch_id: StudioId,
+        session_id: StudioSessionQuery,
+    ) -> WorkerGpuSwitchRuntimeIdentityV1:
+        return await runtime.controller.gpu_switch_runtime_identity(
+            principal, switch_id, session_id
+        )
+
+    @app.post(
+        "/v1/studio/gpu-switches",
+        response_model=NativeWorkerGpuSwitchCreateResponseV1,
+        status_code=201,
+    )
+    async def create_gpu_switch(
+        principal: PrincipalDependency,
+        request: Annotated[CreateGpuSwitchRequestV1, Body()],
+    ) -> NativeWorkerGpuSwitchCreateResponseV1:
+        return await runtime.controller.request_gpu_switch(principal, request)
+
+    @app.post(
+        "/v1/internal/gpu-switches/{switch_id}/settle-create",
+        response_model=NativeWorkerGpuSwitchOwnerLookupV1,
+    )
+    async def settle_gpu_switch_create(
+        principal: PrincipalDependency,
+        switch_id: StudioId,
+        request: Annotated[SettleGpuSwitchCreateRequestV1, Body()],
+    ) -> NativeWorkerGpuSwitchOwnerLookupV1:
+        return await runtime.controller.settle_gpu_switch_create(principal, switch_id, request)
+
+    @app.post(
+        "/v1/studio/gpu-switches/{switch_id}/responses",
+        response_model=StudioStateResponse,
+    )
+    async def respond_to_gpu_switch(
+        principal: PrincipalDependency,
+        switch_id: StudioId,
+        request: Annotated[GpuSwitchResponseRequestV1, Body()],
+    ) -> StudioStateResponse:
+        return await runtime.controller.respond_to_gpu_switch(principal, switch_id, request)
+
+    @app.post(
+        "/v1/studio/gpu-switches/{switch_id}/finalize",
+        response_model=StudioStateResponse,
+    )
+    async def finalize_gpu_switch(
+        principal: PrincipalDependency,
+        switch_id: StudioId,
+        request: Annotated[FinalizeGpuSwitchRequestV1, Body()],
+    ) -> StudioStateResponse:
+        return await runtime.controller.finalize_gpu_switch(principal, switch_id, request)
+
+    @app.post(
+        "/v1/studio/gpu-switches/{switch_id}/delete-intent",
+        response_model=StudioStateResponse,
+    )
+    async def mark_gpu_switch_delete_intent(
+        principal: PrincipalDependency,
+        switch_id: StudioId,
+        request: Annotated[DeleteIntentGpuSwitchRequestV1, Body()],
+    ) -> StudioStateResponse:
+        return await runtime.controller.mark_gpu_switch_delete_intent(principal, switch_id, request)
+
+    @app.post(
+        "/v1/studio/gpu-switches/{switch_id}/adopt",
+        response_model=StudioStateResponse,
+    )
+    async def adopt_gpu_switch_replacement(
+        principal: PrincipalDependency,
+        switch_id: StudioId,
+        request: Annotated[AdoptGpuSwitchRequestV1, Body()],
+    ) -> StudioStateResponse:
+        return await runtime.controller.adopt_gpu_switch_replacement(principal, switch_id, request)
+
+    @app.post(
+        "/v1/studio/gpu-switches/{switch_id}/complete",
+        response_model=StudioStateResponse,
+    )
+    async def complete_gpu_switch(
+        principal: PrincipalDependency,
+        switch_id: StudioId,
+        request: Annotated[CompleteGpuSwitchRequestV1, Body()],
+    ) -> StudioStateResponse:
+        return await runtime.controller.complete_gpu_switch(principal, switch_id, request)
+
+    @app.post(
+        "/v1/studio/gpu-switches/{switch_id}/cancel",
+        response_model=StudioStateResponse,
+    )
+    async def cancel_gpu_switch(
+        principal: PrincipalDependency,
+        switch_id: StudioId,
+        request: Annotated[CancelGpuSwitchRequestV1, Body()],
+    ) -> StudioStateResponse:
+        return await runtime.controller.cancel_gpu_switch(principal, switch_id, request)
+
     @app.post("/v1/batches", response_model=BatchManifest, status_code=201)
     async def create_batch(
         principal: PrincipalDependency,
         request: Annotated[CreateBatchRequest, Body()],
     ) -> BatchManifest:
+        await runtime.controller.preflight_new_submission()
         _require_model_ready(runtime)
         return await runtime.controller.create_batch(principal, request)
+
+    @app.get("/v1/submissions/{client_submission_id}", response_model=BatchManifest)
+    async def get_submission(
+        principal: PrincipalDependency,
+        client_submission_id: SubmissionId,
+    ) -> BatchManifest:
+        return await runtime.controller.get_submission(principal, client_submission_id)
 
     @app.get("/v1/batches/{batch_id}", response_model=BatchManifest)
     async def get_batch(principal: PrincipalDependency, batch_id: BatchId) -> BatchManifest:
@@ -316,9 +478,15 @@ def _file_response(descriptor: ArtifactDescriptor, *, attachment: bool) -> FileR
 def _install_error_handlers(app: FastAPI) -> None:
     @app.exception_handler(WorkerError)
     async def worker_error_handler(_: Request, exc: WorkerError) -> JSONResponse:
-        error: dict[str, Any] = {"code": exc.code, "message": exc.message}
-        if exc.details is not None:
-            error["details"] = dict(exc.details)
+        # Every public worker error uses one exact three-field object. A null
+        # details value is explicit rather than omitted, which keeps the
+        # Python -> native -> renderer contract strict without disclosing
+        # exception, path, owner, or submission-key internals.
+        error: dict[str, Any] = {
+            "code": exc.code,
+            "message": exc.message,
+            "details": dict(exc.details) if exc.details is not None else None,
+        }
         return JSONResponse(
             status_code=exc.status_code,
             content={"schema_version": API_SCHEMA_VERSION, "error": error},
@@ -353,7 +521,11 @@ def _install_error_handlers(app: FastAPI) -> None:
             status_code=exc.status_code,
             content={
                 "schema_version": API_SCHEMA_VERSION,
-                "error": {"code": "not_found", "message": "The endpoint does not exist."},
+                "error": {
+                    "code": "not_found",
+                    "message": "The endpoint does not exist.",
+                    "details": None,
+                },
             },
         )
 

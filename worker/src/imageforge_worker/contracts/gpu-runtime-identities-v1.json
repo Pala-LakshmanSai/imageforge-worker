@@ -1,0 +1,89 @@
+{
+  "schemaVersion": 1,
+  "identities": [
+    {
+      "providerGpuId": "NVIDIA GeForce RTX 4090",
+      "cudaNames": ["NVIDIA GeForce RTX 4090"],
+      "pciDeviceIds": ["0x2684"],
+      "minimumMemoryBytes": 17175674880,
+      "minimumComputeCapability": { "major": 8, "minor": 9 }
+    },
+    {
+      "providerGpuId": "NVIDIA GeForce RTX 5090",
+      "cudaNames": ["NVIDIA GeForce RTX 5090"],
+      "pciDeviceIds": ["0x2b85"],
+      "minimumMemoryBytes": 17175674880,
+      "minimumComputeCapability": { "major": 12, "minor": 0 }
+    },
+    {
+      "providerGpuId": "NVIDIA A100 80GB PCIe",
+      "cudaNames": ["NVIDIA A100 80GB PCIe", "NVIDIA A100-PCIE-80GB"],
+      "pciDeviceIds": ["0x20b5"],
+      "minimumMemoryBytes": 68719476736,
+      "minimumComputeCapability": { "major": 8, "minor": 0 }
+    },
+    {
+      "providerGpuId": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+      "cudaNames": ["NVIDIA RTX PRO 6000 Blackwell Server Edition"],
+      "pciDeviceIds": ["0x2bb5"],
+      "minimumMemoryBytes": 68719476736,
+      "minimumComputeCapability": { "major": 12, "minor": 0 }
+    },
+    {
+      "providerGpuId": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+      "cudaNames": ["NVIDIA RTX PRO 6000 Blackwell Workstation Edition"],
+      "pciDeviceIds": ["0x2bb1"],
+      "minimumMemoryBytes": 68719476736,
+      "minimumComputeCapability": { "major": 12, "minor": 0 }
+    },
+    {
+      "providerGpuId": "NVIDIA RTX PRO 4500 Blackwell",
+      "cudaNames": [
+        "NVIDIA RTX PRO 4500 Blackwell",
+        "NVIDIA RTX PRO 4500 Blackwell Server Edition",
+        "NVIDIA RTX PRO 4500 Blackwell Workstation Edition"
+      ],
+      "pciDeviceIds": ["0x2c31"],
+      "minimumMemoryBytes": 32212254720,
+      "minimumComputeCapability": { "major": 12, "minor": 0 }
+    },
+    {
+      "providerGpuId": "NVIDIA RTX PRO 4000 Blackwell",
+      "cudaNames": [
+        "NVIDIA RTX PRO 4000 Blackwell",
+        "NVIDIA RTX PRO 4000 Blackwell SFF Edition"
+      ],
+      "pciDeviceIds": ["0x2c33", "0x2c34"],
+      "minimumMemoryBytes": 23622320128,
+      "minimumComputeCapability": { "major": 12, "minor": 0 }
+    },
+    {
+      "providerGpuId": "NVIDIA L4",
+      "cudaNames": ["NVIDIA L4"],
+      "pciDeviceIds": ["0x27b8"],
+      "minimumMemoryBytes": 17175674880,
+      "minimumComputeCapability": { "major": 8, "minor": 9 }
+    },
+    {
+      "providerGpuId": "NVIDIA RTX A4500",
+      "cudaNames": ["NVIDIA RTX A4500"],
+      "pciDeviceIds": ["0x2236"],
+      "minimumMemoryBytes": 17175674880,
+      "minimumComputeCapability": { "major": 8, "minor": 6 }
+    },
+    {
+      "providerGpuId": "NVIDIA RTX 4000 Ada Generation",
+      "cudaNames": ["NVIDIA RTX 4000 Ada Generation"],
+      "pciDeviceIds": ["0x26b2"],
+      "minimumMemoryBytes": 17175674880,
+      "minimumComputeCapability": { "major": 8, "minor": 9 }
+    },
+    {
+      "providerGpuId": "NVIDIA RTX 2000 Ada Generation",
+      "cudaNames": ["NVIDIA RTX 2000 Ada Generation"],
+      "pciDeviceIds": ["0x26b8"],
+      "minimumMemoryBytes": 17175674880,
+      "minimumComputeCapability": { "major": 8, "minor": 9 }
+    }
+  ]
+}

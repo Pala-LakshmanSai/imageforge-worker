@@ -4,6 +4,7 @@ import asyncio
 import base64
 import hashlib
 import io
+import uuid
 from pathlib import Path
 
 import httpx
@@ -290,10 +291,20 @@ async def test_two_independent_clients_get_one_atomic_winner(tmp_path: Path) -> 
             transport=second_transport, base_url="http://worker.test"
         ) as other_client:
             first_request = client.post(
-                "/v1/batches", json={"prompts": ["from Lakshman"]}, headers=auth(TOKEN_A)
+                "/v1/batches",
+                json={
+                    "prompts": ["from Lakshman"],
+                    "client_submission_id": str(uuid.uuid4()),
+                },
+                headers=auth(TOKEN_A),
             )
             second_request = other_client.post(
-                "/v1/batches", json={"prompts": ["from Sujal"]}, headers=auth(TOKEN_B)
+                "/v1/batches",
+                json={
+                    "prompts": ["from Sujal"],
+                    "client_submission_id": str(uuid.uuid4()),
+                },
+                headers=auth(TOKEN_B),
             )
             first, second = await asyncio.gather(first_request, second_request)
             assert sorted([first.status_code, second.status_code]) == [201, 423]

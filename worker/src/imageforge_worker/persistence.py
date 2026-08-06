@@ -8,10 +8,13 @@ import re
 import shutil
 import tempfile
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Protocol
+from typing import Literal, Protocol
+
+from pydantic import Field, ValidationError, field_validator, model_validator
 
 if os.name == "nt":
     import msvcrt
@@ -26,14 +29,60 @@ from .domain import (
     BatchState,
     ImageRecord,
     ImageState,
+    StrictModel,
+    require_canonical_uuid4,
 )
+from .gpu_switch_models import require_gpu_identity
 
 MINIMUM_RETENTION = timedelta(hours=24)
 _WINDOWS_PRESENCE_SLOTS = 256
 _GPU_STOP_GUARD_FILENAME = ".gpu-stop-finalization.json"
 _MAX_GPU_STOP_GUARD_BYTES = 2048
 _POD_ID_PATTERN = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,56}[A-Za-z0-9])?$")
-_GPU_DISPLAY_PATTERN = re.compile(r"^[A-Za-z0-9 ._()+-]{1,80}$")
+_MANIFEST_ENVELOPE_SCHEMA_VERSION = 2
+_FINGERPRINT_PATTERN = r"^[0-9a-f]{64}$"
+
+
+class SubmissionStoreCorruptError(RuntimeError):
+    """A v2 envelope cannot safely participate in an idempotent admission.
+
+    The controller deliberately maps this to one opaque public 503 response.
+    Keeping the storage exception distinct avoids accidentally treating a bad
+    envelope as a missing submission and creating another remote batch.
+    """
+
+
+class SubmissionRecord(StrictModel):
+    client_submission_id: str
+    owner_user_id: str = Field(min_length=1)
+    request_fingerprint: str = Field(pattern=_FINGERPRINT_PATTERN)
+
+    @field_validator("client_submission_id")
+    @classmethod
+    def validate_client_submission_id(cls, value: str) -> str:
+        return require_canonical_uuid4(value)
+
+
+class ManifestEnvelopeV2(StrictModel):
+    """Private durable v2 wrapper around the public API manifest."""
+
+    schema_version: Literal[_MANIFEST_ENVELOPE_SCHEMA_VERSION] = _MANIFEST_ENVELOPE_SCHEMA_VERSION
+    manifest: BatchManifest
+    submission: SubmissionRecord
+
+    @model_validator(mode="after")
+    def validate_submission_binding(self) -> ManifestEnvelopeV2:
+        if self.manifest.client_submission_id != self.submission.client_submission_id:
+            raise ValueError("manifest submission ID does not match its private record")
+        if self.manifest.owner.user_id != self.submission.owner_user_id:
+            raise ValueError("manifest owner does not match its private record")
+        return self
+
+
+@dataclass(frozen=True, slots=True)
+class SubmissionMatch:
+    manifest: BatchManifest
+    record: SubmissionRecord
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,11 +128,7 @@ class SharedGpuStopGuard:
             raise ValueError("shared GPU Stop requester must be a safe display name")
         if _POD_ID_PATTERN.fullmatch(self.pod_id) is None:
             raise ValueError("shared GPU Stop pod ID is invalid")
-        if (
-            self.gpu_display_name != self.gpu_display_name.strip()
-            or _GPU_DISPLAY_PATTERN.fullmatch(self.gpu_display_name) is None
-        ):
-            raise ValueError("shared GPU Stop GPU display name is invalid")
+        require_gpu_identity(self.gpu_display_name)
         timestamps = [
             _parse_timestamp(value)
             for value in (self.requested_at, self.response_deadline, self.expires_at)
@@ -107,9 +152,7 @@ class SharedGpuStopGuard:
             raise ValueError("shared GPU Stop timestamps are out of order")
         if response_deadline - requested_at > timedelta(
             seconds=STOP_RESPONSE_TTL_SECONDS
-        ) or expires_at - response_deadline > timedelta(
-            seconds=FINALIZATION_TTL_SECONDS
-        ):
+        ) or expires_at - response_deadline > timedelta(seconds=FINALIZATION_TTL_SECONDS):
             raise ValueError("shared GPU Stop timestamps exceed the safety envelope")
 
 
@@ -127,9 +170,23 @@ class ManifestStore(Protocol):
     @property
     def active_lease_held(self) -> bool: ...
 
+    @property
+    def submission_lease_held(self) -> bool: ...
+
+    @property
+    def gpu_control_lock_held(self) -> bool: ...
+
     def try_acquire_active_lease(self) -> bool: ...
 
     def release_active_lease(self) -> None: ...
+
+    def try_acquire_submission_lease(self) -> bool: ...
+
+    def release_submission_lease(self) -> None: ...
+
+    def try_acquire_gpu_control_lock(self) -> bool: ...
+
+    def release_gpu_control_lock(self) -> None: ...
 
     def write_gpu_stop_guard(self, guard: SharedGpuStopGuard) -> None: ...
 
@@ -142,10 +199,17 @@ class ManifestStore(Protocol):
     def list_batch_ids(self) -> list[str]: ...
 
     def create(
-        self, manifest: BatchManifest, reference_payloads: list[tuple[str, bytes]] | None = None
+        self,
+        manifest: BatchManifest,
+        reference_payloads: list[tuple[str, bytes]] | None = None,
+        submission: SubmissionRecord | None = None,
     ) -> None: ...
 
     def load(self, batch_id: str) -> BatchManifest: ...
+
+    def find_submission(self, client_submission_id: str) -> SubmissionMatch | None: ...
+
+    def submission_store_corrupt(self) -> bool: ...
 
     def save(self, manifest: BatchManifest) -> None: ...
 
@@ -169,17 +233,36 @@ class ManifestStore(Protocol):
 class FileManifestStore:
     """Crash-safe JSON manifests and server-named immutable artifacts."""
 
-    def __init__(self, root: Path, *, fsync_writes: bool = True) -> None:
+    def __init__(
+        self,
+        root: Path,
+        *,
+        fsync_writes: bool = True,
+        crash_hook: Callable[[str], None] | None = None,
+    ) -> None:
         self.root = root
         self.batches_root = root / "batches"
         self.fsync_writes = fsync_writes
+        # Test-only deterministic seam injection. Production never configures
+        # it, and every hook point is after the named durable boundary.
+        self._crash_hook = crash_hook
         self._worker_presence_descriptor: _HeldLock | None = None
         self._maintenance_presence_descriptor: _HeldLock | None = None
         self._active_lease_descriptor: _HeldLock | None = None
+        self._submission_lease_descriptor: _HeldLock | None = None
+        self._gpu_control_descriptor: _HeldLock | None = None
 
     @property
     def active_lease_held(self) -> bool:
         return self._active_lease_descriptor is not None
+
+    @property
+    def submission_lease_held(self) -> bool:
+        return self._submission_lease_descriptor is not None
+
+    @property
+    def gpu_control_lock_held(self) -> bool:
+        return self._gpu_control_descriptor is not None
 
     def initialize(self) -> None:
         self.batches_root.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -238,10 +321,48 @@ class FileManifestStore:
         self._active_lease_descriptor = None
         self._release_lock(descriptor)
 
+    def try_acquire_submission_lease(self) -> bool:
+        """Serialize envelope lookup and first admission across worker processes.
+
+        This short-lived volume lock is independent of the active generation
+        lease: it lets a second worker safely replay an already-admitted key
+        while the first batch is still generating, without ever admitting a
+        second remote batch.
+        """
+
+        if self._submission_lease_descriptor is not None:
+            return True
+        descriptor = self._try_acquire_lock(".submission-history.lock", shared=False)
+        if descriptor is None:
+            return False
+        self._submission_lease_descriptor = descriptor
+        return True
+
+    def release_submission_lease(self) -> None:
+        descriptor = self._submission_lease_descriptor
+        self._submission_lease_descriptor = None
+        self._release_lock(descriptor)
+
+    def try_acquire_gpu_control_lock(self) -> bool:
+        self._require_active_lease()
+        if self._gpu_control_descriptor is not None:
+            return True
+        descriptor = self._try_acquire_lock(".gpu-control-v1.lock", shared=False)
+        if descriptor is None:
+            return False
+        self._gpu_control_descriptor = descriptor
+        return True
+
+    def release_gpu_control_lock(self) -> None:
+        descriptor = self._gpu_control_descriptor
+        self._gpu_control_descriptor = None
+        self._release_lock(descriptor)
+
     def write_gpu_stop_guard(self, guard: SharedGpuStopGuard) -> None:
         """Publish a strict cross-process finalization marker under the active lease."""
 
         self._require_active_lease()
+        self._require_gpu_control_lock()
         payload = json.dumps(
             {
                 "schema_version": 2,
@@ -316,6 +437,7 @@ class FileManifestStore:
         """Idempotently clear only the marker owned by the exact local guard."""
 
         self._require_active_lease()
+        self._require_gpu_control_lock()
         path = self.root / _GPU_STOP_GUARD_FILENAME
         current = self.read_gpu_stop_guard()
         if current is None:
@@ -331,6 +453,7 @@ class FileManifestStore:
         """Clear a crashed owner's marker only after acquiring its released lease."""
 
         self._require_active_lease()
+        self._require_gpu_control_lock()
         path = self.root / _GPU_STOP_GUARD_FILENAME
         path.unlink(missing_ok=True)
         self._fsync_directory(self.root)
@@ -421,9 +544,27 @@ class FileManifestStore:
         return sorted(result)
 
     def create(
-        self, manifest: BatchManifest, reference_payloads: list[tuple[str, bytes]] | None = None
+        self,
+        manifest: BatchManifest,
+        reference_payloads: list[tuple[str, bytes]] | None = None,
+        submission: SubmissionRecord | None = None,
     ) -> None:
+        """Create an immutable batch directory and publish one admission envelope.
+
+        For newly admitted batches the v2 envelope rename is the only commit
+        point. A crash before it leaves an ignored incomplete directory; a
+        crash after it leaves a replayable owner/fingerprint association. The
+        optional legacy path is retained solely so already-persisted v1
+        manifests and explicit migration fixtures remain readable.
+        """
+
         self._require_active_lease()
+        if submission is not None:
+            self._require_submission_lease()
+            self._validate_submission_for_manifest(manifest, submission)
+        elif manifest.client_submission_id is not None:
+            raise ValueError("a manifest submission ID requires a private submission record")
+
         batch_dir = self._batch_dir(manifest.batch_id)
         batch_dir.mkdir(mode=0o700, parents=False, exist_ok=False)
         (batch_dir / "artifacts").mkdir(mode=0o700)
@@ -436,31 +577,97 @@ class FileManifestStore:
             if not relative_name.startswith("references/"):
                 raise ValueError("reference path must remain under the references directory")
             self._write_immutable(path, payload)
+        # The reference data and all newly created directories must be durable
+        # before an envelope can make this submission discoverable.
         self._fsync_directory(references_dir)
+        self._fsync_directory(batch_dir)
         self._fsync_directory(self.batches_root)
-        self.save(manifest)
+        self._crash("after_reference_fsync")
+
+        manifest.recalculate_progress()
+        if submission is None:
+            self._write_legacy_manifest(manifest)
+            return
+        self._write_envelope(manifest, submission, creation=True)
 
     def load(self, batch_id: str) -> BatchManifest:
-        path = self._batch_dir(batch_id) / "manifest.json"
+        manifest, _ = self._read_manifest_record(batch_id)
+        return manifest
+
+    def find_submission(self, client_submission_id: str) -> SubmissionMatch | None:
+        """Return one exact durable submission association or fail closed.
+
+        We deliberately scan every v2 envelope instead of trusting an index.
+        The manifest file is atomically replaced, so a concurrent reader sees
+        either the prior complete file or the next complete file. Scanning all
+        records also lets one malformed v2 envelope disable new admission
+        rather than turning a potentially admitted key into a false miss.
+        """
+
+        require_canonical_uuid4(client_submission_id)
+        self._require_submission_lease()
+        match: SubmissionMatch | None = None
+        for manifest, submission in self._scan_submission_history():
+            if submission is None or submission.client_submission_id != client_submission_id:
+                continue
+            candidate = SubmissionMatch(manifest=manifest, record=submission)
+            if match is not None:
+                # A duplicate key is impossible under the admission lease and
+                # must never be resolved by picking an arbitrary manifest.
+                raise SubmissionStoreCorruptError("duplicate submission association")
+            match = candidate
+        return match
+
+    def submission_store_corrupt(self) -> bool:
+        """Report any malformed persisted manifest/envelope without exposing it."""
+
         try:
-            payload = path.read_bytes()
-        except FileNotFoundError:
+            self._scan_submission_history()
+            return False
+        except SubmissionStoreCorruptError:
+            return True
+
+    def _scan_submission_history(
+        self,
+    ) -> list[tuple[BatchManifest, SubmissionRecord | None]]:
+        """Validate the complete admission namespace as one closed set.
+
+        A duplicate key anywhere makes every create/lookup ambiguous, even if
+        the caller asked about another key. Directory enumeration and record
+        I/O failures are likewise fail-closed instead of accidentally
+        advertising a writable store through `/v1/status`.
+        """
+
+        records: list[tuple[BatchManifest, SubmissionRecord | None]] = []
+        seen_submission_ids: set[str] = set()
+        try:
+            batch_ids = self.list_batch_ids()
+            for batch_id in batch_ids:
+                manifest, submission = self._read_manifest_record(batch_id)
+                if submission is not None:
+                    if submission.client_submission_id in seen_submission_ids:
+                        raise SubmissionStoreCorruptError("duplicate submission association")
+                    seen_submission_ids.add(submission.client_submission_id)
+                records.append((manifest, submission))
+        except SubmissionStoreCorruptError:
             raise
-        return BatchManifest.model_validate_json(payload)
+        except OSError as exc:
+            raise SubmissionStoreCorruptError(
+                "submission history could not be enumerated or read"
+            ) from exc
+        return records
 
     def save(self, manifest: BatchManifest) -> None:
         self._require_active_lease()
+        # Preserve the private record across every progress/receipt mutation.
+        # A v2 manifest cannot silently downgrade to a legacy raw file.
+        _, submission = self._read_manifest_record(manifest.batch_id)
         manifest.recalculate_progress()
-        payload = json.dumps(
-            manifest.model_dump(mode="json"),
-            ensure_ascii=False,
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode("utf-8")
-        path = self._batch_dir(manifest.batch_id) / "manifest.json"
-        if not path.parent.is_dir():
-            raise FileNotFoundError(path.parent)
-        self._atomic_write(path, payload)
+        if submission is None:
+            self._write_legacy_manifest(manifest)
+            return
+        self._validate_submission_for_manifest(manifest, submission)
+        self._write_envelope(manifest, submission, creation=False)
 
     def write_artifacts(
         self, batch_id: str, index: int, jpeg: bytes, preview: bytes
@@ -619,9 +826,96 @@ class FileManifestStore:
         normalized = str(uuid.UUID(str(batch_id)))
         return self.batches_root / normalized
 
+    def _read_manifest_record(self, batch_id: str) -> tuple[BatchManifest, SubmissionRecord | None]:
+        path = self._batch_dir(batch_id) / "manifest.json"
+        try:
+            raw_payload = path.read_bytes()
+        except FileNotFoundError:
+            raise
+        try:
+            payload = json.loads(raw_payload)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise SubmissionStoreCorruptError("manifest JSON is not valid") from exc
+        if not isinstance(payload, dict):
+            raise SubmissionStoreCorruptError("manifest root is not an object")
+
+        # API manifests are schema version 1. New durable storage deliberately
+        # wraps that public document in a private version-2 envelope.
+        if payload.get("schema_version") == _MANIFEST_ENVELOPE_SCHEMA_VERSION:
+            try:
+                envelope = ManifestEnvelopeV2.model_validate_json(raw_payload)
+            except (ValidationError, ValueError) as exc:
+                raise SubmissionStoreCorruptError("v2 manifest envelope is invalid") from exc
+            return envelope.manifest, envelope.submission
+        try:
+            legacy = BatchManifest.model_validate_json(raw_payload)
+        except (ValidationError, ValueError) as exc:
+            # A malformed/unknown document cannot be safely distinguished from
+            # damaged v2 history, so fail closed for new admissions.
+            raise SubmissionStoreCorruptError("legacy manifest document is invalid") from exc
+        if legacy.client_submission_id is not None:
+            raise SubmissionStoreCorruptError("legacy manifest has an unbound submission ID")
+        return legacy, None
+
+    @staticmethod
+    def _validate_submission_for_manifest(
+        manifest: BatchManifest, submission: SubmissionRecord
+    ) -> None:
+        if manifest.client_submission_id != submission.client_submission_id:
+            raise ValueError("manifest submission ID does not match its private record")
+        if manifest.owner.user_id != submission.owner_user_id:
+            raise ValueError("manifest owner does not match its private record")
+
+    def _write_legacy_manifest(self, manifest: BatchManifest) -> None:
+        payload = json.dumps(
+            manifest.model_dump(mode="json"),
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        path = self._batch_dir(manifest.batch_id) / "manifest.json"
+        if not path.parent.is_dir():
+            raise FileNotFoundError(path.parent)
+        self._atomic_write(path, payload)
+
+    def _write_envelope(
+        self,
+        manifest: BatchManifest,
+        submission: SubmissionRecord,
+        *,
+        creation: bool,
+    ) -> None:
+        envelope = ManifestEnvelopeV2(manifest=manifest, submission=submission)
+        payload = json.dumps(
+            envelope.model_dump(mode="json"),
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        path = self._batch_dir(manifest.batch_id) / "manifest.json"
+        if not path.parent.is_dir():
+            raise FileNotFoundError(path.parent)
+        self._atomic_write(
+            path,
+            payload,
+            after_file_sync="after_envelope_fsync" if creation else None,
+            after_rename="after_envelope_rename" if creation else None,
+            extra_fsync_directories=(self.batches_root,) if creation else (),
+        )
+
     def _require_active_lease(self) -> None:
         if self._active_lease_descriptor is None:
             raise RuntimeError("manifest and artifact mutations require the active-volume lease")
+
+    def _require_submission_lease(self) -> None:
+        if self._submission_lease_descriptor is None:
+            raise RuntimeError(
+                "submission lookup and admission require the submission-volume lease"
+            )
+
+    def _require_gpu_control_lock(self) -> None:
+        if self._gpu_control_descriptor is None:
+            raise RuntimeError("GPU-control mutation requires the shared GPU-control lock")
 
     def _write_immutable(self, path: Path, payload: bytes) -> None:
         if path.exists():
@@ -630,7 +924,15 @@ class FileManifestStore:
             raise FileExistsError(f"immutable artifact already exists: {path.name}")
         self._atomic_write(path, payload)
 
-    def _atomic_write(self, path: Path, payload: bytes) -> None:
+    def _atomic_write(
+        self,
+        path: Path,
+        payload: bytes,
+        *,
+        after_file_sync: str | None = None,
+        after_rename: str | None = None,
+        extra_fsync_directories: tuple[Path, ...] = (),
+    ) -> None:
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         descriptor, temporary_name = tempfile.mkstemp(
             dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"
@@ -642,12 +944,22 @@ class FileManifestStore:
                 handle.flush()
                 if self.fsync_writes:
                     os.fsync(handle.fileno())
+            if after_file_sync is not None:
+                self._crash(after_file_sync)
             os.replace(temporary_path, path)
             if self.fsync_writes:
                 self._fsync_directory(path.parent)
+                for directory in extra_fsync_directories:
+                    self._fsync_directory(directory)
+            if after_rename is not None:
+                self._crash(after_rename)
         except BaseException:
             temporary_path.unlink(missing_ok=True)
             raise
+
+    def _crash(self, point: str) -> None:
+        if self._crash_hook is not None:
+            self._crash_hook(point)
 
     def _fsync_directory(self, path: Path) -> None:
         if not self.fsync_writes or not path.exists():

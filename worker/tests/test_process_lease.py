@@ -5,6 +5,7 @@ import json
 import multiprocessing
 import queue
 import time
+import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -77,7 +78,10 @@ def _contention_child(root, user_id, display_name, barrier, release, results) ->
         try:
             manifest = await controller.create_batch(
                 Principal(user_id, display_name),
-                CreateBatchRequest(prompts=[f"from {display_name}"]),
+                CreateBatchRequest(
+                    prompts=[f"from {display_name}"],
+                    client_submission_id=str(uuid.uuid4()),
+                ),
             )
         except WorkerError as exc:
             results.put(
@@ -116,7 +120,10 @@ def _active_owner_child(root, results) -> None:
         await controller.initialize()
         manifest = await controller.create_batch(
             Principal("lakshman", "Lakshman"),
-            CreateBatchRequest(prompts=["durable first", "kill during second"]),
+            CreateBatchRequest(
+                prompts=["durable first", "kill during second"],
+                client_submission_id=str(uuid.uuid4()),
+            ),
         )
         results.put({"batch_id": manifest.batch_id})
         await asyncio.Event().wait()
@@ -221,21 +228,25 @@ def _persistent_observer_child(root, batch_id, ready, release, results) -> None:
         await controller.initialize()
         principal = Principal("lakshman", "Lakshman")
         initial = await controller.status(principal, ready=True)
-        results.put({
-            "phase": "observing",
-            "state": initial.active_batch.state.value if initial.active_batch else None,
-            "can_manage": initial.permissions.can_manage_active,
-        })
+        results.put(
+            {
+                "phase": "observing",
+                "state": initial.active_batch.state.value if initial.active_batch else None,
+                "can_manage": initial.permissions.can_manage_active,
+            }
+        )
         ready.set()
         deadline = asyncio.get_running_loop().time() + 20
         while True:
             status = await controller.status(principal, ready=True)
             if status.active_batch is not None and status.active_batch.state.value == "interrupted":
-                results.put({
-                    "phase": "recovered",
-                    "state": status.active_batch.state.value,
-                    "can_manage": status.permissions.can_manage_active,
-                })
+                results.put(
+                    {
+                        "phase": "recovered",
+                        "state": status.active_batch.state.value,
+                        "can_manage": status.permissions.can_manage_active,
+                    }
+                )
                 await controller.resume(principal, batch_id)
                 break
             if asyncio.get_running_loop().time() >= deadline:
@@ -428,9 +439,7 @@ def _stop_guard_standby_child(root, ready, release, results) -> None:
                             "can_create": status.permissions.can_create,
                             "lease": True,
                             "marker": marker is not None,
-                            "stop": stop.model_dump(mode="json")
-                            if stop is not None
-                            else None,
+                            "stop": stop.model_dump(mode="json") if stop is not None else None,
                             "current_session_id": studio.current_session.session_id,
                         }
                     )
@@ -470,11 +479,12 @@ async def _seed_failed_batch(root: Path) -> str:
     try:
         created = await controller.create_batch(
             principal,
-            CreateBatchRequest(prompts=["durable failed image"]),
+            CreateBatchRequest(
+                prompts=["durable failed image"],
+                client_submission_id=str(uuid.uuid4()),
+            ),
         )
-        completed = await _wait_for_controller_batch(
-            controller, principal, created.batch_id
-        )
+        completed = await _wait_for_controller_batch(controller, principal, created.batch_id)
         assert completed.images[0].status.value == "failed"
         return completed.batch_id
     finally:
@@ -490,7 +500,10 @@ async def _attempt_guarded_generation(root: Path, batch_id: str) -> dict:
         try:
             await controller.create_batch(
                 principal,
-                CreateBatchRequest(prompts=["cross-process create must wait"]),
+                CreateBatchRequest(
+                    prompts=["cross-process create must wait"],
+                    client_submission_id=str(uuid.uuid4()),
+                ),
             )
         except WorkerError as exc:
             create = {"code": exc.code, "details": dict(exc.details or {})}
@@ -519,17 +532,16 @@ async def _run_after_guard_release(root: Path, failed_batch_id: str | None = Non
         retried_state = None
         if failed_batch_id is not None:
             retried = await controller.retry_failed(principal, failed_batch_id)
-            retried = await _wait_for_controller_batch(
-                controller, principal, retried.batch_id
-            )
+            retried = await _wait_for_controller_batch(controller, principal, retried.batch_id)
             retried_state = retried.state.value
         created = await controller.create_batch(
             principal,
-            CreateBatchRequest(prompts=["generation after guard release"]),
+            CreateBatchRequest(
+                prompts=["generation after guard release"],
+                client_submission_id=str(uuid.uuid4()),
+            ),
         )
-        created = await _wait_for_controller_batch(
-            controller, principal, created.batch_id
-        )
+        created = await _wait_for_controller_batch(controller, principal, created.batch_id)
         return {"retried": retried_state, "created": created.state.value}
     finally:
         await controller.shutdown()
@@ -549,7 +561,10 @@ async def _inspect_recovered_guard(root: Path) -> dict:
         try:
             await controller.create_batch(
                 principal,
-                CreateBatchRequest(prompts=["restart must retain stop guard"]),
+                CreateBatchRequest(
+                    prompts=["restart must retain stop guard"],
+                    client_submission_id=str(uuid.uuid4()),
+                ),
             )
         except WorkerError as exc:
             create = {"code": exc.code, "details": dict(exc.details or {})}
@@ -959,9 +974,11 @@ def test_restart_adopts_unexpired_shared_stop_guard_and_fails_closed(
     assert store.read_gpu_stop_guard() == crashed_guard
 
     assert store.try_acquire_active_lease()
+    assert store.try_acquire_gpu_control_lock()
     try:
         store.clear_gpu_stop_guard(crashed_guard)
     finally:
+        store.release_gpu_control_lock()
         store.release_active_lease()
 
 
@@ -1013,9 +1030,11 @@ def test_restart_clears_bounded_stop_guard_shifted_beyond_safety_ttl(
         expires_at=_timestamp(expires_at),
     )
     assert store.try_acquire_active_lease()
+    assert store.try_acquire_gpu_control_lock()
     try:
         store.write_gpu_stop_guard(guard)
     finally:
+        store.release_gpu_control_lock()
         store.release_active_lease()
 
     async def inspect() -> None:
@@ -1062,9 +1081,7 @@ def test_already_running_standby_adopts_guard_after_finalizer_crash(
     assert observing["stop"]["state"] == "finalizing"
     assert observing["stop"]["finalization_id"] is None
     assert observing["stop"]["waiting_for"] == []
-    assert observing["stop"]["requester"]["session_id"] != observing[
-        "current_session_id"
-    ]
+    assert observing["stop"]["requester"]["session_id"] != observing["current_session_id"]
 
     holder.kill()
     holder.join(10)
@@ -1078,9 +1095,7 @@ def test_already_running_standby_adopts_guard_after_finalizer_crash(
         assert adopted["stop"]["state"] == "finalizing"
         assert adopted["stop"]["finalization_id"] is None
         assert adopted["stop"]["waiting_for"] == []
-        assert adopted["stop"]["requester"]["session_id"] != adopted[
-            "current_session_id"
-        ]
+        assert adopted["stop"]["requester"]["session_id"] != adopted["current_session_id"]
     finally:
         standby_release.set()
         _join_or_terminate(standby)
@@ -1089,7 +1104,9 @@ def test_already_running_standby_adopts_guard_after_finalizer_crash(
     marker = store.read_gpu_stop_guard()
     assert marker is not None
     assert store.try_acquire_active_lease()
+    assert store.try_acquire_gpu_control_lock()
     try:
         store.clear_gpu_stop_guard(marker)
     finally:
+        store.release_gpu_control_lock()
         store.release_active_lease()

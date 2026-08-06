@@ -13,6 +13,7 @@ from .auth import Principal
 from .constants import API_SCHEMA_VERSION
 from .domain import BatchManifest, BatchSummary, StrictModel
 from .errors import WorkerError
+from .gpu_switch_models import GpuSwitchRequestViewV1, require_gpu_identity
 
 PRESENCE_TTL_SECONDS = 15
 STOP_RESPONSE_TTL_SECONDS = 30
@@ -21,11 +22,8 @@ MAX_STUDIO_SESSIONS = 16
 MAX_PRINCIPAL_SESSIONS = 8
 MAX_SAFE_REVISION = 9_007_199_254_740_991
 
-UUID4_PATTERN = re.compile(
-    r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
-)
+UUID4_PATTERN = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
 POD_ID_PATTERN = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,56}[A-Za-z0-9])?$")
-GPU_DISPLAY_PATTERN = re.compile(r"^[A-Za-z0-9 ._()+-]{1,80}$")
 
 Availability = Literal["foreground", "background"]
 StopDecision = Literal["approve", "deny"]
@@ -57,7 +55,7 @@ class CreateStopRequest(StrictModel):
     request_id: str
     session_id: str
     pod_id: str = Field(min_length=1, max_length=58)
-    gpu_display_name: str = Field(min_length=1, max_length=80)
+    gpu_display_name: str = Field(min_length=1, max_length=128)
 
     @field_validator("request_id", "session_id")
     @classmethod
@@ -74,9 +72,7 @@ class CreateStopRequest(StrictModel):
     @field_validator("gpu_display_name")
     @classmethod
     def validate_gpu_display_name(cls, value: str) -> str:
-        if value != value.strip() or GPU_DISPLAY_PATTERN.fullmatch(value) is None:
-            raise ValueError("gpu_display_name is invalid")
-        return value
+        return require_gpu_identity(value)
 
 
 class StopResponseRequest(StrictModel):
@@ -152,6 +148,8 @@ class StudioStateResponse(StrictModel):
     sessions: list[StudioSessionView] = Field(max_length=MAX_STUDIO_SESSIONS)
     active_batch: BatchSummary | None
     stop_request: StopRequestView | None
+    gpu_switch_request: GpuSwitchRequestViewV1 | None = None
+    gpu_switch_can_respond: bool = False
 
 
 class CoordinationClock(Protocol):
@@ -281,6 +279,43 @@ class StudioCoordinator:
         self._maintain(now_mono, now_utc)
         self._require_session(principal, session_id)
         return self._state(principal, session_id, active, now_utc)
+
+    def require_foreground_session(
+        self, principal: Principal, session_id: str
+    ) -> CoordinationIdentity:
+        """Return one authenticated live foreground identity for Switch.
+
+        GenerationController already serializes this call with heartbeat and
+        every coordination mutation, so the returned snapshot cannot race a
+        concurrent presence update inside this process.
+        """
+
+        _require_uuid4(session_id)
+        now_mono, now_utc = self._now()
+        self._maintain(now_mono, now_utc)
+        session = self._require_session(principal, session_id)
+        if session.availability != "foreground":
+            raise WorkerError(
+                status_code=423,
+                code="gpu_switch_requester_not_foreground",
+                message="The GPU switch requester must remain foreground.",
+            )
+        return self._identity(session)
+
+    def foreground_principals(
+        self,
+    ) -> dict[str, CoordinationIdentity]:
+        """Deduplicate foreground sessions by principal for Switch consent."""
+
+        now_mono, now_utc = self._now()
+        self._maintain(now_mono, now_utc)
+        return {
+            user_id: self._identity(session)
+            for user_id, session in self._foreground_representatives().items()
+        }
+
+    def principal_has_foreground_session(self, user_id: str) -> bool:
+        return user_id in self.foreground_principals()
 
     def create_stop_request(
         self,
@@ -490,6 +525,45 @@ class StudioCoordinator:
             stop.reason = "generation_started"
             self._touch()
 
+    def admit_queue_generation(self) -> None:
+        """Admit a locally staged successor without cancelling peer Stop consent.
+
+        The caller already holds the same controller lock used by foreground
+        admission. This closes the race where a peer requests Stop between a
+        desktop preflight and its queue POST: foreground Generate retains the
+        historic cancellation rule, while queue admission parks locally.
+        """
+
+        now_mono, now_utc = self._now()
+        self._maintain(now_mono, now_utc)
+        stop = self.stop_request
+        if stop is None:
+            return
+        if stop.state == "finalizing":
+            assert stop.finalization_expires_at is not None
+            raise WorkerError(
+                status_code=423,
+                code="gpu_stop_pending",
+                message="GPU Stop is finalizing; new generation is temporarily blocked.",
+                details={
+                    "request_id": stop.request_id,
+                    "requester": stop.requester_display_name,
+                    "expires_at": _timestamp(stop.finalization_expires_at),
+                },
+            )
+        if stop.state in {"pending", "approved"}:
+            raise WorkerError(
+                status_code=423,
+                code="queue_stop_pending",
+                message="GPU Stop consent is pending; the local queue is paused.",
+                details={
+                    "request_id": stop.request_id,
+                    "requester": stop.requester_display_name,
+                    "state": stop.state,
+                    "expires_at": _timestamp(stop.response_deadline),
+                },
+            )
+
     def rollback_finalization(
         self,
         request_id: str,
@@ -519,9 +593,7 @@ class StudioCoordinator:
         self._touch()
         self._maintain(now_mono, now_utc)
 
-    def finalization_remaining_seconds(
-        self, request_id: str, finalization_id: str
-    ) -> float | None:
+    def finalization_remaining_seconds(self, request_id: str, finalization_id: str) -> float | None:
         """Maintain expiry and return the remaining lifetime of one exact guard."""
 
         _require_uuid4(request_id)
@@ -602,11 +674,13 @@ class StudioCoordinator:
             self._touch()
 
     def _foreground_representatives(
-        self, requester_user_id: str
+        self, requester_user_id: str | None = None
     ) -> dict[str, CoordinationIdentity]:
         by_user: dict[str, list[_Session]] = {}
         for session in self.sessions.values():
-            if session.user_id == requester_user_id or session.availability != "foreground":
+            if (
+                requester_user_id is not None and session.user_id == requester_user_id
+            ) or session.availability != "foreground":
                 continue
             by_user.setdefault(session.user_id, []).append(session)
         return {
@@ -688,9 +762,7 @@ class StudioCoordinator:
         ]
 
     @staticmethod
-    def _decision_identities(
-        stop: _StopRequest, user_ids: set[str]
-    ) -> list[CoordinationIdentity]:
+    def _decision_identities(stop: _StopRequest, user_ids: set[str]) -> list[CoordinationIdentity]:
         return [
             stop.participants[user_id]
             for user_id in sorted(user_ids)
@@ -745,10 +817,7 @@ class StudioCoordinator:
         self, principal: Principal, session_id: str, request_id: str
     ) -> _StopRequest:
         stop = self._require_stop_request(request_id)
-        if (
-            stop.requester_user_id != principal.user_id
-            or stop.requester_session_id != session_id
-        ):
+        if stop.requester_user_id != principal.user_id or stop.requester_session_id != session_id:
             raise WorkerError(
                 status_code=404,
                 code="stop_request_not_found",

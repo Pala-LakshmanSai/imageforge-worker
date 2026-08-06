@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import uuid
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Literal
@@ -55,6 +56,17 @@ class BatchState(StrEnum):
     INTERRUPTED = "interrupted"
 
 
+class AdmissionMode(StrEnum):
+    """How a foreground desktop is asking to admit one worker batch.
+
+    This is deliberately not a worker queue. ``queue`` only changes the
+    coordinated-Stop race rule for a locally staged item.
+    """
+
+    FOREGROUND = "foreground"
+    QUEUE = "queue"
+
+
 class ImageState(StrEnum):
     PENDING = "pending"
     GENERATING = "generating"
@@ -76,6 +88,21 @@ NONTERMINAL_IMAGE_STATES = {
 
 ReferenceMime = Literal["image/jpeg", "image/png", "image/webp"]
 AspectRatio = Literal["16:9", "1:1", "9:16", "4:3", "3:4"]
+
+CANONICAL_UUID4_PATTERN = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+)
+
+
+def require_canonical_uuid4(value: str) -> str:
+    """Reject alternate UUID spellings before they become durable keys."""
+
+    if CANONICAL_UUID4_PATTERN.fullmatch(value) is None:
+        raise ValueError("identifier must be a canonical lowercase UUIDv4")
+    parsed = uuid.UUID(value)
+    if parsed.version != 4 or parsed.variant != uuid.RFC_4122 or str(parsed) != value:
+        raise ValueError("identifier must be a canonical lowercase UUIDv4")
+    return value
 
 
 class ReferenceInput(StrictModel):
@@ -130,10 +157,28 @@ class StoredReference(StrictModel):
 
 
 class CreateBatchRequest(StrictModel):
+    client_submission_id: str
+    admission_mode: AdmissionMode = AdmissionMode.FOREGROUND
     prompts: list[str] = Field(min_length=1)
     base_seed: int = Field(default=0, ge=0, le=MAX_SEED)
     aspect_ratio: AspectRatio = "16:9"
     references: list[ReferenceInput] = Field(default_factory=list, max_length=MAX_REFERENCES)
+
+    @field_validator("client_submission_id")
+    @classmethod
+    def validate_client_submission_id(cls, value: str) -> str:
+        return require_canonical_uuid4(value)
+
+    @field_validator("admission_mode", mode="before")
+    @classmethod
+    def validate_admission_mode(cls, value: object) -> AdmissionMode:
+        # FastAPI has already decoded JSON to Python before StrictModel sees
+        # it, so normalize only the two allowed wire strings explicitly.
+        if isinstance(value, str):
+            return AdmissionMode(value)
+        if isinstance(value, AdmissionMode):
+            return value
+        raise ValueError("admission_mode is invalid")
 
     @field_validator("prompts")
     @classmethod
@@ -283,6 +328,10 @@ class BatchManifest(StrictModel):
     model_config = ConfigDict(extra="forbid", strict=True, validate_assignment=False)
     schema_version: Literal[API_SCHEMA_VERSION] = API_SCHEMA_VERSION
     batch_id: str
+    # Legacy v1 manifest files did not have a durable submission association.
+    # New v2 envelopes require this value and validate it against their private
+    # idempotency record before any replay is possible.
+    client_submission_id: str | None = None
     owner: BatchOwner
     state: BatchState
     created_at: str
@@ -295,6 +344,11 @@ class BatchManifest(StrictModel):
     references: list[StoredReference] = Field(default_factory=list, max_length=MAX_REFERENCES)
     images: list[ImageRecord]
     progress: BatchProgress
+
+    @field_validator("client_submission_id")
+    @classmethod
+    def validate_manifest_submission_id(cls, value: str | None) -> str | None:
+        return None if value is None else require_canonical_uuid4(value)
 
     @model_validator(mode="after")
     def validate_order(self) -> BatchManifest:
@@ -355,6 +409,25 @@ class StatusPermissions(StrictModel):
     can_create: bool
     can_manage_active: bool
     is_owner: bool
+    create_block_reason: Literal["gpu_stop_pending", "submission_store_corrupt"] | None
+    can_switch: bool
+    switch_block_code: (
+        Literal[
+            "requester_not_foreground",
+            "runtime_identity_unavailable",
+            "current_pod_unverified",
+            "local_receipts_pending",
+            "queue_dispatch_uncertain",
+            "foreign_batch_owner_unavailable",
+            "stop_request_in_progress",
+            "gpu_stop_pending",
+            "gpu_switch_request_in_progress",
+            "gpu_switch_pending",
+            "gpu_control_guard_conflict",
+            "gpu_switch_store_corrupt",
+        ]
+        | None
+    )
 
 
 class StatusResponse(StrictModel):

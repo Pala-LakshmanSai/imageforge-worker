@@ -22,10 +22,11 @@ JPEG_QUALITY: Final = 95
 PREVIEW_WIDTH: Final = 320
 PREVIEW_HEIGHT: Final = 180
 
-# Seeds are passed to the inference backend as signed 64-bit integers. Prompt
-# lists themselves are intentionally unbounded; practical request, storage,
-# and GPU limits remain outside the domain model.
-MAX_SEED: Final = 2**63 - 1
+# Queue snapshots, the desktop bridge, and the worker all carry seeds as JSON
+# numbers. Keep the wire value inside JavaScript's exact integer range rather
+# than accepting a Python-only signed-64-bit value that another client could
+# round before it reaches the GPU.
+MAX_SEED: Final = 9_007_199_254_740_991
 MAX_GENERATION_ATTEMPTS: Final = 3
 
 # Batch-level reference images are deliberately bounded for predictable request

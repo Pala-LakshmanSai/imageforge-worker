@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -11,9 +12,32 @@ import pytest
 from imageforge_worker.app import create_app
 from imageforge_worker.config import Credential, WorkerSettings
 from imageforge_worker.inference import FakeInferenceAdapter, InferenceAdapter
+from imageforge_worker.persistence import ManifestStore
 
 TOKEN_A = "lakshman-worker-token-000000000001"
 TOKEN_B = "sujal-worker-token-00000000000002"
+
+
+class _LegacyBatchTestClient(httpx.AsyncClient):
+    """Keep pre-queue lifecycle tests on valid unique submission requests.
+
+    Those tests exercise batching, receipts, and leases rather than request
+    construction. New Task 013 API tests opt out to prove that the real HTTP
+    endpoint rejects a missing submission ID.
+    """
+
+    async def post(self, url: str, *args, **kwargs):  # type: ignore[no-untyped-def]
+        payload = kwargs.get("json")
+        if (
+            url == "/v1/batches"
+            and isinstance(payload, dict)
+            and "client_submission_id" not in payload
+        ):
+            kwargs["json"] = {
+                **payload,
+                "client_submission_id": str(uuid.uuid4()),
+            }
+        return await super().post(url, *args, **kwargs)
 
 
 @pytest.fixture
@@ -54,15 +78,19 @@ async def worker_client(
     wait_until_ready: bool = True,
     fsync_writes: bool = True,
     runtime_metadata: dict[str, str] | None = None,
+    inject_submission_ids: bool = True,
+    store: ManifestStore | None = None,
 ) -> AsyncIterator[tuple[httpx.AsyncClient, object, InferenceAdapter]]:
     selected = adapter or FakeInferenceAdapter()
     app = create_app(
         settings_for(root, fsync_writes=fsync_writes, runtime_metadata=runtime_metadata),
         inference=selected,
+        store=store,
     )
     async with app.router.lifespan_context(app):
         transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
-        async with httpx.AsyncClient(transport=transport, base_url="http://worker.test") as client:
+        client_type = _LegacyBatchTestClient if inject_submission_ids else httpx.AsyncClient
+        async with client_type(transport=transport, base_url="http://worker.test") as client:
             if wait_until_ready:
                 await wait_for_health(client, "ready")
             yield client, app, selected

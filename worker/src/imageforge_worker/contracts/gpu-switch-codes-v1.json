@@ -1,0 +1,964 @@
+{
+  "schemaVersion": 1,
+  "precedence": [
+    "gpu_switch_store_corrupt",
+    "gpu_control_guard_conflict",
+    "gpu_stop_pending",
+    "gpu_switch_pending",
+    "stop_request_in_progress",
+    "gpu_switch_request_in_progress",
+    "local_receipts_pending",
+    "queue_dispatch_uncertain",
+    "current_pod_unverified",
+    "runtime_identity_unavailable",
+    "foreign_batch_owner_unavailable",
+    "requester_not_foreground"
+  ],
+  "codes": [
+    {
+      "code": "gpu_switch_store_recovered",
+      "scope": "native_issue",
+      "retryable": false,
+      "httpStatus": null,
+      "permittedBlockedPhases": []
+    },
+    {
+      "code": "gpu_switch_store_unrecoverable",
+      "scope": "native_issue",
+      "retryable": false,
+      "httpStatus": null,
+      "permittedBlockedPhases": []
+    },
+    {
+      "code": "gpu_switch_active",
+      "scope": "native_issue",
+      "retryable": false,
+      "httpStatus": null,
+      "permittedBlockedPhases": []
+    },
+    {
+      "code": "gpu_switch_not_found",
+      "scope": "native_issue",
+      "retryable": false,
+      "httpStatus": null,
+      "permittedBlockedPhases": []
+    },
+    {
+      "code": "gpu_switch_revision_conflict",
+      "scope": "native_issue",
+      "retryable": true,
+      "httpStatus": null,
+      "permittedBlockedPhases": []
+    },
+    {
+      "code": "gpu_switch_revision_exhausted",
+      "scope": "native_issue",
+      "retryable": false,
+      "httpStatus": null,
+      "permittedBlockedPhases": []
+    },
+    {
+      "code": "gpu_switch_lease_busy",
+      "scope": "native_issue",
+      "retryable": true,
+      "httpStatus": null,
+      "permittedBlockedPhases": []
+    },
+    {
+      "code": "gpu_switch_lease_required",
+      "scope": "native_issue",
+      "retryable": false,
+      "httpStatus": null,
+      "permittedBlockedPhases": []
+    },
+    {
+      "code": "gpu_switch_transition_invalid",
+      "scope": "native_issue",
+      "retryable": false,
+      "httpStatus": null,
+      "permittedBlockedPhases": []
+    },
+    {
+      "code": "gpu_switch_foreground_grant_required",
+      "scope": "native_issue",
+      "retryable": false,
+      "httpStatus": null,
+      "permittedBlockedPhases": []
+    },
+    {
+      "code": "gpu_switch_foreground_grant_invalid",
+      "scope": "native_issue",
+      "retryable": false,
+      "httpStatus": null,
+      "permittedBlockedPhases": []
+    },
+    {
+      "code": "gpu_switch_foreground_grant_expired",
+      "scope": "native_issue",
+      "retryable": false,
+      "httpStatus": null,
+      "permittedBlockedPhases": []
+    },
+    {
+      "code": "gpu_switch_foreground_grant_consumed",
+      "scope": "native_issue",
+      "retryable": false,
+      "httpStatus": null,
+      "permittedBlockedPhases": []
+    },
+    {
+      "code": "queue_gpu_switch_pending",
+      "scope": "native_issue",
+      "retryable": false,
+      "httpStatus": null,
+      "permittedBlockedPhases": []
+    },
+    {
+      "code": "gpu_switch_queue_reservation_conflict",
+      "scope": "native_issue",
+      "retryable": false,
+      "httpStatus": null,
+      "permittedBlockedPhases": []
+    },
+    {
+      "code": "gpu_switch_queue_reservation_corrupt",
+      "scope": "native_issue",
+      "retryable": false,
+      "httpStatus": null,
+      "permittedBlockedPhases": []
+    },
+    {
+      "code": "gpu_switch_queue_dispatch_uncertain",
+      "scope": "native_issue",
+      "retryable": false,
+      "httpStatus": null,
+      "permittedBlockedPhases": []
+    },
+    {
+      "code": "gpu_switch_local_receipts_pending",
+      "scope": "native_issue",
+      "retryable": false,
+      "httpStatus": null,
+      "permittedBlockedPhases": []
+    },
+    {
+      "code": "gpu_switch_inventory_unavailable",
+      "scope": "native_issue",
+      "retryable": true,
+      "httpStatus": null,
+      "permittedBlockedPhases": []
+    },
+    {
+      "code": "gpu_switch_inventory_stale",
+      "scope": "native_issue",
+      "retryable": false,
+      "httpStatus": null,
+      "permittedBlockedPhases": []
+    },
+    {
+      "code": "gpu_switch_inventory_receipt_invalid",
+      "scope": "native_issue",
+      "retryable": false,
+      "httpStatus": null,
+      "permittedBlockedPhases": []
+    },
+    {
+      "code": "gpu_switch_price_changed",
+      "scope": "native_issue",
+      "retryable": false,
+      "httpStatus": null,
+      "permittedBlockedPhases": []
+    },
+    {
+      "code": "gpu_actual_price_changed",
+      "scope": "native_issue",
+      "retryable": false,
+      "httpStatus": null,
+      "permittedBlockedPhases": []
+    },
+    {
+      "code": "gpu_actual_price_unavailable",
+      "scope": "native_issue",
+      "retryable": false,
+      "httpStatus": null,
+      "permittedBlockedPhases": []
+    },
+    {
+      "code": "gpu_identity_invalid",
+      "scope": "native_issue",
+      "retryable": false,
+      "httpStatus": null,
+      "permittedBlockedPhases": []
+    },
+    {
+      "code": "gpu_switch_target_unapproved",
+      "scope": "native_issue",
+      "retryable": false,
+      "httpStatus": null,
+      "permittedBlockedPhases": []
+    },
+    {
+      "code": "gpu_switch_target_unavailable",
+      "scope": "native_issue",
+      "retryable": false,
+      "httpStatus": null,
+      "permittedBlockedPhases": []
+    },
+    {
+      "code": "gpu_switch_current_pod_unverified",
+      "scope": "native_issue",
+      "retryable": false,
+      "httpStatus": null,
+      "permittedBlockedPhases": []
+    },
+    {
+      "code": "gpu_switch_requester_not_foreground",
+      "scope": "native_issue",
+      "retryable": false,
+      "httpStatus": null,
+      "permittedBlockedPhases": []
+    },
+    {
+      "code": "gpu_switch_old_pod_changed",
+      "scope": "native_issue",
+      "retryable": false,
+      "httpStatus": null,
+      "permittedBlockedPhases": []
+    },
+    {
+      "code": "gpu_switch_old_pod_disappeared_early",
+      "scope": "native_issue",
+      "retryable": false,
+      "httpStatus": null,
+      "permittedBlockedPhases": []
+    },
+    {
+      "code": "gpu_switch_profile_locked",
+      "scope": "native_issue",
+      "retryable": false,
+      "httpStatus": null,
+      "permittedBlockedPhases": []
+    },
+    {
+      "code": "gpu_switch_worker_create_uncertain",
+      "scope": "native_issue",
+      "retryable": false,
+      "httpStatus": null,
+      "permittedBlockedPhases": []
+    },
+    {
+      "code": "gpu_switch_worker_response_invalid",
+      "scope": "native_issue",
+      "retryable": false,
+      "httpStatus": null,
+      "permittedBlockedPhases": []
+    },
+    {
+      "code": "gpu_switch_worker_guard_missing",
+      "scope": "native_issue",
+      "retryable": false,
+      "httpStatus": null,
+      "permittedBlockedPhases": []
+    },
+    {
+      "code": "gpu_switch_delete_uncertain",
+      "scope": "native_issue",
+      "retryable": false,
+      "httpStatus": null,
+      "permittedBlockedPhases": []
+    },
+    {
+      "code": "gpu_switch_create_uncertain",
+      "scope": "native_issue",
+      "retryable": false,
+      "httpStatus": null,
+      "permittedBlockedPhases": []
+    },
+    {
+      "code": "gpu_switch_replacement_ambiguous",
+      "scope": "native_issue",
+      "retryable": false,
+      "httpStatus": null,
+      "permittedBlockedPhases": []
+    },
+    {
+      "code": "gpu_switch_replacement_mismatch",
+      "scope": "native_issue",
+      "retryable": false,
+      "httpStatus": null,
+      "permittedBlockedPhases": []
+    },
+    {
+      "code": "gpu_switch_provider_response_mismatch",
+      "scope": "native_issue",
+      "retryable": false,
+      "httpStatus": null,
+      "permittedBlockedPhases": []
+    },
+    {
+      "code": "gpu_switch_zero_match_unproven",
+      "scope": "native_issue",
+      "retryable": false,
+      "httpStatus": null,
+      "permittedBlockedPhases": []
+    },
+    {
+      "code": "gpu_switch_replacement_cleanup_required",
+      "scope": "native_issue",
+      "retryable": false,
+      "httpStatus": null,
+      "permittedBlockedPhases": []
+    },
+    {
+      "code": "gpu_switch_replacement_delete_uncertain",
+      "scope": "native_issue",
+      "retryable": false,
+      "httpStatus": null,
+      "permittedBlockedPhases": []
+    },
+    {
+      "code": "gpu_switch_peer_pod_present",
+      "scope": "native_issue",
+      "retryable": false,
+      "httpStatus": null,
+      "permittedBlockedPhases": []
+    },
+    {
+      "code": "gpu_switch_peer_pod_overflow",
+      "scope": "native_issue",
+      "retryable": false,
+      "httpStatus": null,
+      "permittedBlockedPhases": []
+    },
+    {
+      "code": "gpu_switch_quote_invalid",
+      "scope": "native_issue",
+      "retryable": false,
+      "httpStatus": null,
+      "permittedBlockedPhases": []
+    },
+    {
+      "code": "gpu_switch_quote_expired",
+      "scope": "native_issue",
+      "retryable": false,
+      "httpStatus": null,
+      "permittedBlockedPhases": []
+    },
+    {
+      "code": "gpu_switch_quote_consumed",
+      "scope": "native_issue",
+      "retryable": false,
+      "httpStatus": null,
+      "permittedBlockedPhases": []
+    },
+    {
+      "code": "gpu_switch_pause_failed",
+      "scope": "native_issue",
+      "retryable": false,
+      "httpStatus": null,
+      "permittedBlockedPhases": []
+    },
+    {
+      "code": "gpu_switch_completion_failed",
+      "scope": "native_issue",
+      "retryable": false,
+      "httpStatus": null,
+      "permittedBlockedPhases": []
+    },
+    {
+      "code": "gpu_switch_cancel_not_allowed",
+      "scope": "native_issue",
+      "retryable": false,
+      "httpStatus": null,
+      "permittedBlockedPhases": []
+    },
+    {
+      "code": "stop_request_in_progress",
+      "scope": "native_issue",
+      "retryable": false,
+      "httpStatus": null,
+      "permittedBlockedPhases": []
+    },
+    {
+      "code": "gpu_stop_pending",
+      "scope": "native_issue",
+      "retryable": false,
+      "httpStatus": null,
+      "permittedBlockedPhases": []
+    },
+    {
+      "code": "gpu_switch_request_in_progress",
+      "scope": "native_issue",
+      "retryable": false,
+      "httpStatus": null,
+      "permittedBlockedPhases": []
+    },
+    {
+      "code": "gpu_switch_pending",
+      "scope": "native_issue",
+      "retryable": false,
+      "httpStatus": null,
+      "permittedBlockedPhases": []
+    },
+    {
+      "code": "gpu_control_guard_conflict",
+      "scope": "native_issue",
+      "retryable": false,
+      "httpStatus": null,
+      "permittedBlockedPhases": []
+    },
+    {
+      "code": "gpu_switch_store_corrupt",
+      "scope": "native_issue",
+      "retryable": false,
+      "httpStatus": null,
+      "permittedBlockedPhases": []
+    },
+    {
+      "code": "gpu_switch_runtime_identity_unavailable",
+      "scope": "native_issue",
+      "retryable": false,
+      "httpStatus": null,
+      "permittedBlockedPhases": []
+    },
+    {
+      "code": "gpu_switch_revision_exhausted",
+      "scope": "native_attention",
+      "retryable": false,
+      "httpStatus": null,
+      "permittedBlockedPhases": [
+        "planned",
+        "consent_pending",
+        "pausing",
+        "ready_to_delete",
+        "delete_intent",
+        "delete_uncertain",
+        "old_absent",
+        "create_intent",
+        "create_uncertain",
+        "replacement_identified",
+        "provisioning",
+        "replacement_failed",
+        "replacement_delete_intent",
+        "replacement_delete_uncertain",
+        "ready_paused"
+      ]
+    },
+    {
+      "code": "gpu_actual_price_changed",
+      "scope": "native_attention",
+      "retryable": false,
+      "httpStatus": null,
+      "permittedBlockedPhases": [
+        "replacement_identified",
+        "provisioning"
+      ]
+    },
+    {
+      "code": "gpu_actual_price_unavailable",
+      "scope": "native_attention",
+      "retryable": false,
+      "httpStatus": null,
+      "permittedBlockedPhases": [
+        "replacement_identified",
+        "provisioning"
+      ]
+    },
+    {
+      "code": "gpu_switch_target_unavailable",
+      "scope": "native_attention",
+      "retryable": false,
+      "httpStatus": null,
+      "permittedBlockedPhases": [
+        "old_absent"
+      ]
+    },
+    {
+      "code": "gpu_switch_old_pod_changed",
+      "scope": "native_attention",
+      "retryable": false,
+      "httpStatus": null,
+      "permittedBlockedPhases": [
+        "planned",
+        "consent_pending",
+        "pausing",
+        "ready_to_delete"
+      ]
+    },
+    {
+      "code": "gpu_switch_old_pod_disappeared_early",
+      "scope": "native_attention",
+      "retryable": false,
+      "httpStatus": null,
+      "permittedBlockedPhases": [
+        "planned",
+        "consent_pending",
+        "pausing",
+        "ready_to_delete"
+      ]
+    },
+    {
+      "code": "gpu_switch_profile_locked",
+      "scope": "native_attention",
+      "retryable": false,
+      "httpStatus": null,
+      "permittedBlockedPhases": [
+        "planned",
+        "consent_pending",
+        "pausing",
+        "ready_to_delete",
+        "delete_intent",
+        "delete_uncertain",
+        "old_absent",
+        "create_intent",
+        "create_uncertain",
+        "replacement_identified",
+        "provisioning",
+        "replacement_failed",
+        "replacement_delete_intent",
+        "replacement_delete_uncertain",
+        "ready_paused"
+      ]
+    },
+    {
+      "code": "gpu_switch_worker_create_uncertain",
+      "scope": "native_attention",
+      "retryable": false,
+      "httpStatus": null,
+      "permittedBlockedPhases": [
+        "planned"
+      ]
+    },
+    {
+      "code": "gpu_switch_worker_response_invalid",
+      "scope": "native_attention",
+      "retryable": false,
+      "httpStatus": null,
+      "permittedBlockedPhases": [
+        "planned",
+        "consent_pending"
+      ]
+    },
+    {
+      "code": "gpu_switch_worker_guard_missing",
+      "scope": "native_attention",
+      "retryable": false,
+      "httpStatus": null,
+      "permittedBlockedPhases": [
+        "pausing",
+        "ready_to_delete",
+        "delete_intent"
+      ]
+    },
+    {
+      "code": "gpu_switch_replacement_ambiguous",
+      "scope": "native_attention",
+      "retryable": false,
+      "httpStatus": null,
+      "permittedBlockedPhases": [
+        "old_absent",
+        "create_intent",
+        "create_uncertain",
+        "replacement_identified",
+        "provisioning"
+      ]
+    },
+    {
+      "code": "gpu_switch_replacement_mismatch",
+      "scope": "native_attention",
+      "retryable": false,
+      "httpStatus": null,
+      "permittedBlockedPhases": [
+        "replacement_identified",
+        "provisioning",
+        "ready_paused"
+      ]
+    },
+    {
+      "code": "gpu_switch_provider_response_mismatch",
+      "scope": "native_attention",
+      "retryable": false,
+      "httpStatus": null,
+      "permittedBlockedPhases": [
+        "create_intent",
+        "create_uncertain",
+        "replacement_identified",
+        "provisioning"
+      ]
+    },
+    {
+      "code": "gpu_switch_zero_match_unproven",
+      "scope": "native_attention",
+      "retryable": false,
+      "httpStatus": null,
+      "permittedBlockedPhases": [
+        "create_uncertain"
+      ]
+    },
+    {
+      "code": "gpu_switch_peer_pod_present",
+      "scope": "native_attention",
+      "retryable": false,
+      "httpStatus": null,
+      "permittedBlockedPhases": [
+        "old_absent",
+        "create_intent",
+        "create_uncertain",
+        "replacement_identified",
+        "provisioning",
+        "replacement_failed",
+        "replacement_delete_intent",
+        "replacement_delete_uncertain",
+        "ready_paused"
+      ]
+    },
+    {
+      "code": "gpu_switch_peer_pod_overflow",
+      "scope": "native_attention",
+      "retryable": false,
+      "httpStatus": null,
+      "permittedBlockedPhases": [
+        "old_absent",
+        "create_intent",
+        "create_uncertain",
+        "replacement_identified",
+        "provisioning",
+        "replacement_failed",
+        "replacement_delete_intent",
+        "replacement_delete_uncertain",
+        "ready_paused"
+      ]
+    },
+    {
+      "code": "gpu_switch_pause_failed",
+      "scope": "native_attention",
+      "retryable": false,
+      "httpStatus": null,
+      "permittedBlockedPhases": [
+        "pausing"
+      ]
+    },
+    {
+      "code": "gpu_switch_completion_failed",
+      "scope": "native_attention",
+      "retryable": false,
+      "httpStatus": null,
+      "permittedBlockedPhases": [
+        "provisioning",
+        "ready_paused"
+      ]
+    },
+    {
+      "code": "gpu_switch_runtime_identity_unavailable",
+      "scope": "native_attention",
+      "retryable": false,
+      "httpStatus": null,
+      "permittedBlockedPhases": [
+        "provisioning",
+        "ready_paused"
+      ]
+    },
+    {
+      "code": "gpu_switch_store_corrupt",
+      "scope": "worker_block",
+      "retryable": false,
+      "httpStatus": null,
+      "permittedBlockedPhases": []
+    },
+    {
+      "code": "gpu_control_guard_conflict",
+      "scope": "worker_block",
+      "retryable": false,
+      "httpStatus": null,
+      "permittedBlockedPhases": []
+    },
+    {
+      "code": "gpu_stop_pending",
+      "scope": "worker_block",
+      "retryable": false,
+      "httpStatus": null,
+      "permittedBlockedPhases": []
+    },
+    {
+      "code": "gpu_switch_pending",
+      "scope": "worker_block",
+      "retryable": false,
+      "httpStatus": null,
+      "permittedBlockedPhases": []
+    },
+    {
+      "code": "stop_request_in_progress",
+      "scope": "worker_block",
+      "retryable": false,
+      "httpStatus": null,
+      "permittedBlockedPhases": []
+    },
+    {
+      "code": "gpu_switch_request_in_progress",
+      "scope": "worker_block",
+      "retryable": false,
+      "httpStatus": null,
+      "permittedBlockedPhases": []
+    },
+    {
+      "code": "local_receipts_pending",
+      "scope": "worker_block",
+      "retryable": false,
+      "httpStatus": null,
+      "permittedBlockedPhases": []
+    },
+    {
+      "code": "queue_dispatch_uncertain",
+      "scope": "worker_block",
+      "retryable": false,
+      "httpStatus": null,
+      "permittedBlockedPhases": []
+    },
+    {
+      "code": "current_pod_unverified",
+      "scope": "worker_block",
+      "retryable": false,
+      "httpStatus": null,
+      "permittedBlockedPhases": []
+    },
+    {
+      "code": "runtime_identity_unavailable",
+      "scope": "worker_block",
+      "retryable": false,
+      "httpStatus": null,
+      "permittedBlockedPhases": []
+    },
+    {
+      "code": "foreign_batch_owner_unavailable",
+      "scope": "worker_block",
+      "retryable": false,
+      "httpStatus": null,
+      "permittedBlockedPhases": []
+    },
+    {
+      "code": "requester_not_foreground",
+      "scope": "worker_block",
+      "retryable": false,
+      "httpStatus": null,
+      "permittedBlockedPhases": []
+    },
+    {
+      "code": "gpu_control_guard_conflict",
+      "scope": "worker_action",
+      "retryable": false,
+      "httpStatus": 503,
+      "permittedBlockedPhases": []
+    },
+    {
+      "code": "gpu_stop_pending",
+      "scope": "worker_action",
+      "retryable": false,
+      "httpStatus": 423,
+      "permittedBlockedPhases": []
+    },
+    {
+      "code": "gpu_switch_adoption_mismatch",
+      "scope": "worker_action",
+      "retryable": false,
+      "httpStatus": 409,
+      "permittedBlockedPhases": []
+    },
+    {
+      "code": "gpu_switch_approval_pending",
+      "scope": "worker_action",
+      "retryable": false,
+      "httpStatus": 409,
+      "permittedBlockedPhases": []
+    },
+    {
+      "code": "gpu_switch_batch_changed",
+      "scope": "worker_action",
+      "retryable": false,
+      "httpStatus": 409,
+      "permittedBlockedPhases": []
+    },
+    {
+      "code": "gpu_switch_cancel_not_allowed",
+      "scope": "worker_action",
+      "retryable": false,
+      "httpStatus": 409,
+      "permittedBlockedPhases": []
+    },
+    {
+      "code": "gpu_switch_completion_not_ready",
+      "scope": "worker_action",
+      "retryable": false,
+      "httpStatus": 409,
+      "permittedBlockedPhases": []
+    },
+    {
+      "code": "gpu_switch_current_pod_unverified",
+      "scope": "worker_action",
+      "retryable": false,
+      "httpStatus": 409,
+      "permittedBlockedPhases": []
+    },
+    {
+      "code": "gpu_switch_finalization_mismatch",
+      "scope": "worker_action",
+      "retryable": false,
+      "httpStatus": 409,
+      "permittedBlockedPhases": []
+    },
+    {
+      "code": "gpu_switch_identity_mismatch",
+      "scope": "worker_action",
+      "retryable": false,
+      "httpStatus": 409,
+      "permittedBlockedPhases": []
+    },
+    {
+      "code": "gpu_switch_local_receipts_pending",
+      "scope": "worker_action",
+      "retryable": false,
+      "httpStatus": 409,
+      "permittedBlockedPhases": []
+    },
+    {
+      "code": "gpu_switch_not_approved",
+      "scope": "worker_action",
+      "retryable": false,
+      "httpStatus": 409,
+      "permittedBlockedPhases": []
+    },
+    {
+      "code": "gpu_switch_pending",
+      "scope": "worker_action",
+      "retryable": false,
+      "httpStatus": 423,
+      "permittedBlockedPhases": []
+    },
+    {
+      "code": "gpu_switch_queue_dispatch_uncertain",
+      "scope": "worker_action",
+      "retryable": false,
+      "httpStatus": 423,
+      "permittedBlockedPhases": []
+    },
+    {
+      "code": "gpu_switch_request_in_progress",
+      "scope": "worker_action",
+      "retryable": false,
+      "httpStatus": 409,
+      "permittedBlockedPhases": []
+    },
+    {
+      "code": "gpu_switch_request_not_found",
+      "scope": "worker_action",
+      "retryable": false,
+      "httpStatus": 404,
+      "permittedBlockedPhases": []
+    },
+    {
+      "code": "gpu_switch_requester_not_foreground",
+      "scope": "worker_action",
+      "retryable": false,
+      "httpStatus": 423,
+      "permittedBlockedPhases": []
+    },
+    {
+      "code": "gpu_switch_response_conflict",
+      "scope": "worker_action",
+      "retryable": false,
+      "httpStatus": 409,
+      "permittedBlockedPhases": []
+    },
+    {
+      "code": "gpu_switch_response_not_allowed",
+      "scope": "worker_action",
+      "retryable": false,
+      "httpStatus": 409,
+      "permittedBlockedPhases": []
+    },
+    {
+      "code": "gpu_switch_runtime_identity_unavailable",
+      "scope": "worker_action",
+      "retryable": false,
+      "httpStatus": 503,
+      "permittedBlockedPhases": []
+    },
+    {
+      "code": "gpu_switch_store_corrupt",
+      "scope": "worker_action",
+      "retryable": false,
+      "httpStatus": 503,
+      "permittedBlockedPhases": []
+    },
+    {
+      "code": "queue_switch_pending",
+      "scope": "worker_action",
+      "retryable": false,
+      "httpStatus": 423,
+      "permittedBlockedPhases": []
+    },
+    {
+      "code": "stop_request_in_progress",
+      "scope": "worker_action",
+      "retryable": false,
+      "httpStatus": 409,
+      "permittedBlockedPhases": []
+    },
+    {
+      "code": "switch_owner_unavailable",
+      "scope": "worker_action",
+      "retryable": false,
+      "httpStatus": 423,
+      "permittedBlockedPhases": []
+    }
+  ],
+  "blockActionMappings": [
+    {
+      "blockCode": "requester_not_foreground",
+      "actionCode": "gpu_switch_requester_not_foreground"
+    },
+    {
+      "blockCode": "runtime_identity_unavailable",
+      "actionCode": "gpu_switch_runtime_identity_unavailable"
+    },
+    {
+      "blockCode": "current_pod_unverified",
+      "actionCode": "gpu_switch_current_pod_unverified"
+    },
+    {
+      "blockCode": "local_receipts_pending",
+      "actionCode": "gpu_switch_local_receipts_pending"
+    },
+    {
+      "blockCode": "queue_dispatch_uncertain",
+      "actionCode": "gpu_switch_queue_dispatch_uncertain"
+    },
+    {
+      "blockCode": "foreign_batch_owner_unavailable",
+      "actionCode": "switch_owner_unavailable"
+    },
+    {
+      "blockCode": "stop_request_in_progress",
+      "actionCode": "stop_request_in_progress"
+    },
+    {
+      "blockCode": "gpu_stop_pending",
+      "actionCode": "gpu_stop_pending"
+    },
+    {
+      "blockCode": "gpu_switch_request_in_progress",
+      "actionCode": "gpu_switch_request_in_progress"
+    },
+    {
+      "blockCode": "gpu_switch_pending",
+      "actionCode": "gpu_switch_pending"
+    },
+    {
+      "blockCode": "gpu_control_guard_conflict",
+      "actionCode": "gpu_control_guard_conflict"
+    },
+    {
+      "blockCode": "gpu_switch_store_corrupt",
+      "actionCode": "gpu_switch_store_corrupt"
+    }
+  ]
+}

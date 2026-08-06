@@ -94,7 +94,12 @@ async def test_non_ascii_authorization_is_always_a_safe_401(tmp_path: Path) -> N
             headers=[(b"authorization", b"Bearer " + b"\xff" * 16)],
         )
         assert response.status_code == 401
-        assert response.json()["error"]["code"] == "authentication_required"
+        assert response.json()["schema_version"] == 1
+        assert response.json()["error"] == {
+            "code": "authentication_required",
+            "message": "A valid worker bearer credential is required.",
+            "details": None,
+        }
 
 
 @pytest.mark.anyio
@@ -114,18 +119,26 @@ async def test_validation_is_strict_and_does_not_echo_prompts(tmp_path: Path) ->
         wrong_type = await client.post("/v1/batches", json={"prompts": [123]}, headers=auth())
         assert wrong_type.status_code == 422
 
+        not_found = await client.get("/v1/does-not-exist", headers=auth())
+        assert not_found.status_code == 404
+        assert not_found.json()["error"] == {
+            "code": "not_found",
+            "message": "The endpoint does not exist.",
+            "details": None,
+        }
+
 
 def test_large_prompt_and_receipt_models_have_no_product_count_or_text_cap() -> None:
     prompts = [f"prompt {index}" for index in range(501)]
     prompts[500] = "long prompt " + "x" * 5000
-    request = CreateBatchRequest(prompts=prompts)
+    request = CreateBatchRequest(
+        prompts=prompts,
+        client_submission_id="00000000-0000-4000-8000-000000000001",
+    )
     assert request.prompts == prompts
 
     receipts = ReceiptRequest(
-        receipts=[
-            {"index": index, "sha256": "0" * 64, "size_bytes": 1}
-            for index in range(1, 502)
-        ]
+        receipts=[{"index": index, "sha256": "0" * 64, "size_bytes": 1} for index in range(1, 502)]
     )
     assert len(receipts.receipts) == 501
 
@@ -134,6 +147,7 @@ def test_reference_request_bounds_are_practical_and_typed() -> None:
     with pytest.raises(ValueError):
         CreateBatchRequest(
             prompts=["safe"],
+            client_submission_id="00000000-0000-4000-8000-000000000002",
             references=[
                 {
                     "name": "too-large.png",
@@ -145,6 +159,7 @@ def test_reference_request_bounds_are_practical_and_typed() -> None:
     with pytest.raises(ValueError):
         CreateBatchRequest(
             prompts=["safe"],
+            client_submission_id="00000000-0000-4000-8000-000000000003",
             references=[
                 {"name": f"ref-{index}.png", "mime_type": "image/png", "data_hex": "00"}
                 for index in range(9)

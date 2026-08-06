@@ -35,6 +35,8 @@ STATE_KEYS = {
     "sessions",
     "active_batch",
     "stop_request",
+    "gpu_switch_request",
+    "gpu_switch_can_respond",
 }
 
 
@@ -101,9 +103,7 @@ async def _heartbeat(
 
 
 async def _state(client, session_id: str, *, token: str = TOKEN_A) -> dict:
-    response = await client.get(
-        f"/v1/studio/sessions/{session_id}", headers=auth(token)
-    )
+    response = await client.get(f"/v1/studio/sessions/{session_id}", headers=auth(token))
     assert response.status_code == 200, response.text
     return response.json()
 
@@ -167,9 +167,7 @@ async def test_heartbeat_is_authenticated_strict_safe_and_get_does_not_extend_tt
         assert TOKEN_A not in str(first)
         assert TOKEN_B not in str(first)
 
-        foreign = await client.get(
-            f"/v1/studio/sessions/{A_SESSION}", headers=auth(TOKEN_B)
-        )
+        foreign = await client.get(f"/v1/studio/sessions/{A_SESSION}", headers=auth(TOKEN_B))
         assert foreign.status_code == 404
         assert foreign.json()["error"]["code"] == "studio_session_not_found"
 
@@ -192,9 +190,7 @@ async def test_heartbeat_is_authenticated_strict_safe_and_get_does_not_extend_tt
         observed = await _state(client, A_SESSION)
         assert observed["coordination_revision"] == first["coordination_revision"]
         clock.advance(2)
-        expired = await client.get(
-            f"/v1/studio/sessions/{A_SESSION}", headers=auth()
-        )
+        expired = await client.get(f"/v1/studio/sessions/{A_SESSION}", headers=auth())
         assert expired.status_code == 404
         assert expired.json()["error"]["code"] == "studio_session_not_found"
 
@@ -222,8 +218,7 @@ async def test_duplicate_windows_count_once_and_any_session_for_peer_can_decide(
         for peer_session in (B_SESSION, B_SESSION_2):
             peer = await _state(client, peer_session, token=TOKEN_B)
             assert any(
-                item["session_id"] == peer_session
-                for item in peer["stop_request"]["waiting_for"]
+                item["session_id"] == peer_session for item in peer["stop_request"]["waiting_for"]
             )
 
         approved = await client.post(
@@ -234,9 +229,7 @@ async def test_duplicate_windows_count_once_and_any_session_for_peer_can_decide(
         assert approved.status_code == 200
         stop = approved.json()["stop_request"]
         assert stop["state"] == "approved"
-        assert stop["approved_by"] == [
-            {"session_id": B_SESSION, "display_name": "Sujal"}
-        ]
+        assert stop["approved_by"] == [{"session_id": B_SESSION, "display_name": "Sujal"}]
 
         duplicate = await client.post(
             f"/v1/studio/stop-requests/{REQUEST_A}/responses",
@@ -276,15 +269,11 @@ async def test_finalization_guard_blocks_create_until_exact_cancel(tmp_path: Pat
         assert finalizing.json()["stop_request"]["state"] == "finalizing"
         duplicate = await _finalize(client, A_SESSION)
         assert duplicate.status_code == 200
-        mismatch = await _finalize(
-            client, A_SESSION, finalization_id=FINALIZATION_B
-        )
+        mismatch = await _finalize(client, A_SESSION, finalization_id=FINALIZATION_B)
         assert mismatch.status_code == 409
         assert mismatch.json()["error"]["code"] == "finalization_mismatch"
 
-        blocked = await client.post(
-            "/v1/batches", headers=auth(), json={"prompts": ["must wait"]}
-        )
+        blocked = await client.post("/v1/batches", headers=auth(), json={"prompts": ["must wait"]})
         assert blocked.status_code == 423
         assert blocked.json()["error"]["code"] == "gpu_stop_pending"
         assert blocked.json()["error"]["details"]["request_id"] == REQUEST_A
@@ -309,9 +298,7 @@ async def test_finalization_guard_blocks_create_until_exact_cancel(tmp_path: Pat
         assert cancelled.json()["stop_request"]["state"] == "cancelled"
         assert cancelled.json()["stop_request"]["reason"] == "requester_cancelled"
 
-        created = await client.post(
-            "/v1/batches", headers=auth(), json={"prompts": ["safe now"]}
-        )
+        created = await client.post("/v1/batches", headers=auth(), json={"prompts": ["safe now"]})
         assert created.status_code == 201
         await wait_for_batch(client, created.json()["batch_id"], state="completed")
 
@@ -415,9 +402,7 @@ async def test_paused_and_interrupted_batches_are_unconditional_stop_vetoes(
 
         interrupted_veto = await _request_stop(client, B_SESSION, token=TOKEN_B)
         assert interrupted_veto.status_code == 423
-        assert interrupted_veto.json()["error"]["code"] == (
-            "stop_blocked_by_active_batch"
-        )
+        assert interrupted_veto.json()["error"]["code"] == ("stop_blocked_by_active_batch")
         await client.post(f"/v1/batches/{batch_id}/cancel", headers=auth())
 
 
@@ -432,9 +417,7 @@ async def test_dynamic_peers_background_and_expiry_recompute_approval(tmp_path: 
         joined = await _heartbeat(client, B_SESSION, token=TOKEN_B)
         assert joined["stop_request"]["state"] == "pending"
         assert joined["stop_request"]["waiting_for"][0]["display_name"] == "Sujal"
-        background = await _heartbeat(
-            client, B_SESSION, token=TOKEN_B, availability="background"
-        )
+        background = await _heartbeat(client, B_SESSION, token=TOKEN_B, availability="background")
         assert background["stop_request"]["state"] == "approved"
         foreground = await _heartbeat(client, B_SESSION, token=TOKEN_B)
         assert foreground["stop_request"]["state"] == "pending"
@@ -582,14 +565,10 @@ async def test_finalize_and_create_race_is_serialized_at_worker_boundary(tmp_pat
                 json={"session_id": A_SESSION, "finalization_id": FINALIZATION_A},
             )
         else:
-            assert finalize_response.json()["error"]["code"] == (
-                "stop_blocked_by_active_batch"
-            )
+            assert finalize_response.json()["error"]["code"] == ("stop_blocked_by_active_batch")
             assert create_response.status_code == 201
             release.set()
-            await wait_for_batch(
-                client, create_response.json()["batch_id"], state="completed"
-            )
+            await wait_for_batch(client, create_response.json()["batch_id"], state="completed")
         release.set()
 
 
@@ -598,12 +577,8 @@ async def test_finalization_guard_blocks_retry_and_expires_safely(tmp_path: Path
     adapter = FakeInferenceAdapter(failures_before_success={1: 99})
     async with worker_client(tmp_path / "volume", adapter) as (client, app, _):
         clock = _install_clock(app)
-        failed = await client.post(
-            "/v1/batches", headers=auth(), json={"prompts": ["fail safely"]}
-        )
-        manifest = await wait_for_batch(
-            client, failed.json()["batch_id"], state="completed"
-        )
+        failed = await client.post("/v1/batches", headers=auth(), json={"prompts": ["fail safely"]})
+        manifest = await wait_for_batch(client, failed.json()["batch_id"], state="completed")
         assert manifest["images"][0]["status"] == "failed"
 
         await _heartbeat(client, A_SESSION)
@@ -642,14 +617,10 @@ async def test_finalization_guard_outlives_requester_presence_during_ambiguous_d
         clock.advance(10)
         finalized = await _finalize(client, A_SESSION)
         assert finalized.json()["stop_request"]["state"] == "finalizing"
-        await _heartbeat(
-            client, B_SESSION, token=TOKEN_B, availability="background"
-        )
+        await _heartbeat(client, B_SESSION, token=TOKEN_B, availability="background")
 
         clock.advance(14)
-        await _heartbeat(
-            client, B_SESSION, token=TOKEN_B, availability="background"
-        )
+        await _heartbeat(client, B_SESSION, token=TOKEN_B, availability="background")
         clock.advance(14)
         after_requester_expiry = await _state(client, B_SESSION, token=TOKEN_B)
         assert after_requester_expiry["stop_request"]["state"] == "finalizing"
@@ -661,9 +632,7 @@ async def test_finalization_guard_outlives_requester_presence_during_ambiguous_d
         assert blocked.json()["error"]["code"] == "gpu_stop_pending"
 
         clock.advance(14)
-        await _heartbeat(
-            client, B_SESSION, token=TOKEN_B, availability="background"
-        )
+        await _heartbeat(client, B_SESSION, token=TOKEN_B, availability="background")
         still_blocked = await client.post(
             "/v1/batches",
             headers=auth(TOKEN_B),
@@ -673,9 +642,7 @@ async def test_finalization_guard_outlives_requester_presence_during_ambiguous_d
         assert still_blocked.json()["error"]["code"] == "gpu_stop_pending"
 
         clock.advance(14)
-        await _heartbeat(
-            client, B_SESSION, token=TOKEN_B, availability="background"
-        )
+        await _heartbeat(client, B_SESSION, token=TOKEN_B, availability="background")
         clock.advance(5)
         expired = await _state(client, B_SESSION, token=TOKEN_B)
         assert expired["stop_request"]["state"] == "expired"
@@ -688,9 +655,7 @@ async def test_finalization_guard_blocks_resume_even_if_manifest_changes_after_g
 ) -> None:
     async with worker_client(tmp_path / "volume") as (client, app, _):
         _install_clock(app)
-        created = await client.post(
-            "/v1/batches", headers=auth(), json={"prompts": ["completed"]}
-        )
+        created = await client.post("/v1/batches", headers=auth(), json={"prompts": ["completed"]})
         batch_id = created.json()["batch_id"]
         await wait_for_batch(client, batch_id, state="completed")
         await _heartbeat(client, A_SESSION)
@@ -725,9 +690,7 @@ async def test_worker_restart_invalidates_sessions_requests_and_finalization_gra
     async with worker_client(volume) as (client, app, _):
         clock = AdjustableSystemClock()
         app.state.runtime.controller.coordination.clock = clock
-        stale_session = await client.get(
-            f"/v1/studio/sessions/{A_SESSION}", headers=auth()
-        )
+        stale_session = await client.get(f"/v1/studio/sessions/{A_SESSION}", headers=auth())
         assert stale_session.status_code == 404
         fresh = await _heartbeat(client, A_SESSION)
         assert fresh["server_instance_id"] != first_instance

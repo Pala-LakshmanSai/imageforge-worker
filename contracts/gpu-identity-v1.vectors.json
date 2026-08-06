@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "accepted": [
+    { "label": "single", "value": "A" },
+    { "label": "l4", "value": "NVIDIA L4" },
+    { "label": "blackwell-region", "value": "RTX PRO 4500 Blackwell:EU-RO-1" },
+    { "label": "punctuation", "value": "GPU(_)+.-:Z" },
+    { "label": "exactly-128-bytes", "value": "A::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::Z" }
+  ],
+  "rejected": [
+    { "label": "empty", "value": "" },
+    { "label": "leading-space", "value": " NVIDIA L4" },
+    { "label": "trailing-space", "value": "NVIDIA L4 " },
+    { "label": "leading-colon", "value": ":GPU" },
+    { "label": "trailing-colon", "value": "GPU:" },
+    { "label": "exactly-129-bytes", "value": "A:::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::Z" },
+    { "label": "slash", "value": "GPU/4090" },
+    { "label": "backslash", "value": "GPU\\4090" },
+    { "label": "tab", "value": "GPU\t4090" },
+    { "label": "line-feed", "value": "GPU\n4090" },
+    { "label": "nul", "value": "GPU\u00004090" },
+    { "label": "non-breaking-space", "value": "GPU\u00a04090" },
+    { "label": "non-ascii", "value": "GPU🔥" }
+  ]
+}

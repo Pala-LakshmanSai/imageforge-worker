@@ -9,6 +9,8 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
+
 from imageforge_worker.auth import Principal
 from imageforge_worker.cleanup_retention import cleanup_retained_artifacts
 from imageforge_worker.controller import GenerationController
@@ -847,9 +849,13 @@ def test_shared_stop_guard_blocks_cross_process_create_and_retry_until_exact_can
 
         commands.put("advance_16")
         after_16 = _queue_result(results)
+        # The remaining lifetime is a difference of two monotonic readings whose
+        # magnitude depends on host uptime, so it carries float64 representation
+        # error on some machines. The guard contract is the remaining seconds,
+        # not their exact bit pattern.
+        assert after_16.pop("remaining") == pytest.approx(44.0)
         assert after_16 == {
             "phase": "after_16",
-            "remaining": 44.0,
             "lease": True,
             "marker": True,
         }

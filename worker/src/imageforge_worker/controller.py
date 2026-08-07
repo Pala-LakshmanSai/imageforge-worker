@@ -132,6 +132,10 @@ class GenerationController:
         self.max_attempts = max_attempts
         self.retry_delay_seconds = retry_delay_seconds
         self._lock = asyncio.Lock()
+        # batch_id -> manifest fingerprint last observed in a terminal state.
+        # Purely an I/O memo for observation-only discovery; a changed
+        # fingerprint always falls back to reading the manifest.
+        self._inactive_batch_fingerprints: dict[str, tuple[int, int, int]] = {}
         self.coordination = StudioCoordinator(
             clock=coordination_clock,
             finalization_ttl_seconds=coordination_finalization_ttl_seconds,
@@ -1672,6 +1676,12 @@ class GenerationController:
     def _discover_active_locked(self, *, recover: bool) -> BatchManifest | None:
         active_manifests: list[BatchManifest] = []
         for batch_id in self.store.list_batch_ids():
+            if not recover and self._known_inactive_locked(batch_id):
+                # Observation-only discovery runs on every `/v1/status` poll.
+                # A manifest whose bytes have not changed since we last read it
+                # cannot have entered a lock-holding state, so re-reading it
+                # from the network volume can only produce the same answer.
+                continue
             try:
                 manifest = self.store.load(batch_id)
             except SubmissionStoreCorruptError:
@@ -1682,11 +1692,28 @@ class GenerationController:
             changed = self._recover_manifest(manifest) if recover else False
             if manifest.state in LOCK_HOLDING_STATES:
                 active_manifests.append(manifest)
+            elif not changed:
+                self._remember_inactive_locked(batch_id)
             if changed:
                 self.store.save(manifest)
         if len(active_manifests) > 1:
             raise RuntimeError("persistent volume contains multiple active batch leases")
         return active_manifests[0] if active_manifests else None
+
+    def _known_inactive_locked(self, batch_id: str) -> bool:
+        remembered = self._inactive_batch_fingerprints.get(batch_id)
+        if remembered is None:
+            return False
+        current = self.store.manifest_fingerprint(batch_id)
+        if current == remembered:
+            return True
+        self._inactive_batch_fingerprints.pop(batch_id, None)
+        return False
+
+    def _remember_inactive_locked(self, batch_id: str) -> None:
+        fingerprint = self.store.manifest_fingerprint(batch_id)
+        if fingerprint is not None:
+            self._inactive_batch_fingerprints[batch_id] = fingerprint
 
     def _refresh_active_observation_locked(self) -> BatchManifest | None:
         active = self._refresh_active_observation_unchecked_locked()

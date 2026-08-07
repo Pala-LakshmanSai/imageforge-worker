@@ -8,6 +8,7 @@ import re
 import shutil
 import tempfile
 import uuid
+from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -40,6 +41,9 @@ _GPU_STOP_GUARD_FILENAME = ".gpu-stop-finalization.json"
 _MAX_GPU_STOP_GUARD_BYTES = 2048
 _POD_ID_PATTERN = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,56}[A-Za-z0-9])?$")
 _MANIFEST_ENVELOPE_SCHEMA_VERSION = 2
+# Enough to keep the active batch plus a peer read hot without holding whole
+# historical manifests in memory.
+_DOCUMENT_CACHE_ENTRIES = 4
 _FINGERPRINT_PATTERN = r"^[0-9a-f]{64}$"
 
 
@@ -207,6 +211,8 @@ class ManifestStore(Protocol):
 
     def load(self, batch_id: str) -> BatchManifest: ...
 
+    def manifest_fingerprint(self, batch_id: str) -> tuple[int, int, int] | None: ...
+
     def find_submission(self, client_submission_id: str) -> SubmissionMatch | None: ...
 
     def submission_store_corrupt(self) -> bool: ...
@@ -251,6 +257,17 @@ class FileManifestStore:
         self._active_lease_descriptor: _HeldLock | None = None
         self._submission_lease_descriptor: _HeldLock | None = None
         self._gpu_control_descriptor: _HeldLock | None = None
+        # Namespace fingerprint -> corruption verdict for the last full scan.
+        self._submission_scan_cache: (
+            tuple[tuple[tuple[str, int, int, int], ...], bool] | None
+        ) = None
+        # batch_id -> (document fingerprint, raw bytes). Manifests are only ever
+        # replaced atomically, so a fingerprint match proves the cached bytes
+        # are still exactly what the volume holds. Only the network-volume read
+        # is elided; every caller still gets a freshly parsed, unaliased model.
+        self._document_cache: OrderedDict[str, tuple[tuple[int, int, int], bytes]] = (
+            OrderedDict()
+        )
 
     @property
     def active_lease_held(self) -> bool:
@@ -619,13 +636,58 @@ class FileManifestStore:
         return match
 
     def submission_store_corrupt(self) -> bool:
-        """Report any malformed persisted manifest/envelope without exposing it."""
+        """Report any malformed persisted manifest/envelope without exposing it.
+
+        `/v1/status` is polled continuously, so the full-namespace scan cannot
+        run per request: it reads and validates every manifest ever written to
+        the shared volume, which is network storage. Cache the verdict against
+        a cheap identity fingerprint of the namespace instead. Any create,
+        progress write, receipt, or external edit replaces a manifest file
+        atomically, which changes its inode/size/mtime and therefore forces a
+        rescan. The observable fail-closed contract is unchanged; only the
+        repeated I/O for an unchanged namespace is removed.
+        """
 
         try:
-            self._scan_submission_history()
-            return False
-        except SubmissionStoreCorruptError:
+            fingerprint = self._submission_namespace_fingerprint()
+        except OSError:
+            self._submission_scan_cache = None
             return True
+        cached = self._submission_scan_cache
+        if cached is not None and cached[0] == fingerprint:
+            return cached[1]
+        try:
+            self._scan_submission_history()
+            corrupt = False
+        except SubmissionStoreCorruptError:
+            corrupt = True
+        # Re-fingerprint after the scan. A manifest rewritten while the scan
+        # was running must not be recorded as validated under its old identity.
+        try:
+            settled = self._submission_namespace_fingerprint()
+        except OSError:
+            self._submission_scan_cache = None
+            return True
+        self._submission_scan_cache = (settled, corrupt) if settled == fingerprint else None
+        return corrupt
+
+    def _submission_namespace_fingerprint(self) -> tuple[tuple[str, int, int, int], ...]:
+        """Identify every manifest document without reading or parsing one."""
+
+        if not self.batches_root.exists():
+            return ()
+        entries: list[tuple[str, int, int, int]] = []
+        for child in sorted(self.batches_root.iterdir(), key=lambda path: path.name):
+            if not child.is_dir():
+                continue
+            try:
+                status = os.stat(child / "manifest.json")
+            except FileNotFoundError:
+                continue
+            entries.append(
+                (child.name, status.st_ino, status.st_size, status.st_mtime_ns)
+            )
+        return tuple(entries)
 
     def _scan_submission_history(
         self,
@@ -826,12 +888,53 @@ class FileManifestStore:
         normalized = str(uuid.UUID(str(batch_id)))
         return self.batches_root / normalized
 
-    def _read_manifest_record(self, batch_id: str) -> tuple[BatchManifest, SubmissionRecord | None]:
+    def manifest_fingerprint(self, batch_id: str) -> tuple[int, int, int] | None:
+        """Identify a manifest document without reading or parsing it."""
+
+        try:
+            status = os.stat(self._batch_dir(batch_id) / "manifest.json")
+        except (FileNotFoundError, ValueError):
+            return None
+        return (status.st_ino, status.st_size, status.st_mtime_ns)
+
+    def _read_manifest_document(self, batch_id: str) -> bytes:
+        """Return the manifest bytes, re-reading only when the file changed.
+
+        The shared volume is network storage and the desktop reads status,
+        manifests, and artifacts continuously. Re-reading an unchanged document
+        for every one of those requests is what stalled the event loop.
+        """
+
         path = self._batch_dir(batch_id) / "manifest.json"
         try:
-            raw_payload = path.read_bytes()
+            status = os.stat(path)
         except FileNotFoundError:
+            self._document_cache.pop(batch_id, None)
             raise
+        fingerprint = (status.st_ino, status.st_size, status.st_mtime_ns)
+        cached = self._document_cache.get(batch_id)
+        if cached is not None and cached[0] == fingerprint:
+            self._document_cache.move_to_end(batch_id)
+            return cached[1]
+        raw_payload = path.read_bytes()
+        # Only cache when the file did not change under the read. Otherwise the
+        # fingerprint would label a torn or superseded document as current.
+        try:
+            settled = os.stat(path)
+        except FileNotFoundError:
+            self._document_cache.pop(batch_id, None)
+            return raw_payload
+        if (settled.st_ino, settled.st_size, settled.st_mtime_ns) == fingerprint:
+            self._document_cache[batch_id] = (fingerprint, raw_payload)
+            self._document_cache.move_to_end(batch_id)
+            while len(self._document_cache) > _DOCUMENT_CACHE_ENTRIES:
+                self._document_cache.popitem(last=False)
+        else:
+            self._document_cache.pop(batch_id, None)
+        return raw_payload
+
+    def _read_manifest_record(self, batch_id: str) -> tuple[BatchManifest, SubmissionRecord | None]:
+        raw_payload = self._read_manifest_document(batch_id)
         try:
             payload = json.loads(raw_payload)
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:

@@ -195,3 +195,40 @@ async def test_slow_volume_acknowledgement_does_not_stall_the_event_loop(
             f"rescheduled for {worst_stall:.3f}s while a {VOLUME_DELAY_SECONDS}s "
             "manifest write ran inside a coroutine"
         )
+
+
+@pytest.mark.anyio
+async def test_health_reports_io_and_loop_diagnostics(tmp_path: Path) -> None:
+    """/v1/health carries unauthenticated counters for field diagnosis.
+
+    Inferring worker behaviour from response latency alone is what left the
+    status rescan undiagnosed for a whole run. These counters make volume reads
+    and loop blocking directly observable without a bearer token.
+    """
+    root = tmp_path / "volume"
+    async with worker_client(root) as (client, _app, _):
+        created = await client.post(
+            "/v1/batches",
+            json={"prompts": ["only frame"], "base_seed": 100},
+            headers=auth(),
+        )
+        assert created.status_code == 201
+        await wait_for_batch(client, created.json()["batch_id"], state="completed")
+
+        payload = (await client.get("/v1/health")).json()
+        diagnostics = payload["diagnostics"]
+        for field in (
+            "volume_manifest_reads",
+            "manifest_cache_hits",
+            "artifact_digest_computations",
+            "loop_lag_recent_ms",
+            "loop_lag_peak_ms",
+        ):
+            assert field in diagnostics, f"health diagnostics missing {field}"
+        assert diagnostics["volume_manifest_reads"] >= 1
+
+        # `recent` is a per-interval window: reading it resets it, so a poller
+        # sees blocking that happened since its last poll, not one old spike.
+        assert (await client.get("/v1/health")).json()["diagnostics"][
+            "loop_lag_recent_ms"
+        ] < diagnostics["loop_lag_peak_ms"] + 1

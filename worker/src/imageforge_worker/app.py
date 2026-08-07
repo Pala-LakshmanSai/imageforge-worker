@@ -105,6 +105,13 @@ class WorkerRuntime:
     health: HealthTracker
     authenticator: BearerAuthenticator
     boot_task: asyncio.Task[None] | None = None
+    lag_task: asyncio.Task[None] | None = None
+    # Worst event-loop scheduling delay seen, in milliseconds. `peak` is for the
+    # whole process; `recent` covers the window since the last /v1/health read
+    # and is reset by it, so a poller sees per-interval blocking rather than one
+    # historical spike.
+    loop_lag_peak_ms: float = 0.0
+    loop_lag_recent_ms: float = 0.0
 
 
 def create_app(
@@ -140,16 +147,20 @@ def create_app(
     async def lifespan(_: FastAPI):
         # Yield immediately after scheduling boot so /v1/health is available during model load.
         runtime.boot_task = asyncio.create_task(_boot(runtime), name="imageforge-worker-boot")
+        runtime.lag_task = asyncio.create_task(
+            _monitor_loop_lag(runtime), name="imageforge-worker-loop-lag"
+        )
         try:
             yield
         finally:
             await runtime.controller.shutdown()
-            if runtime.boot_task is not None and not runtime.boot_task.done():
-                runtime.boot_task.cancel()
-                try:
-                    await runtime.boot_task
-                except asyncio.CancelledError:
-                    pass
+            for task in (runtime.boot_task, runtime.lag_task):
+                if task is not None and not task.done():
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
             await runtime.inference.shutdown()
 
     app = FastAPI(
@@ -199,10 +210,55 @@ def _build_inference(settings: WorkerSettings) -> InferenceAdapter:
     return FluxInferenceAdapter(settings.model_cache_dir)
 
 
+async def _monitor_loop_lag(runtime: WorkerRuntime, tick: float = 0.05) -> None:
+    """Record how late the loop reschedules a trivial sleep.
+
+    A cooperative loop returns within roughly `tick`. Synchronous volume I/O
+    inside a coroutine cannot be preempted, so the overshoot is a direct measure
+    of how long the worker was blocked -- attributable without guessing from the
+    outside, which is how the status-rescan stall stayed hidden.
+    """
+
+    loop = asyncio.get_running_loop()
+    previous = loop.time()
+    while True:
+        await asyncio.sleep(tick)
+        now = loop.time()
+        lag_ms = max(0.0, (now - previous - tick) * 1000)
+        previous = now
+        if lag_ms > runtime.loop_lag_recent_ms:
+            runtime.loop_lag_recent_ms = lag_ms
+        if lag_ms > runtime.loop_lag_peak_ms:
+            runtime.loop_lag_peak_ms = lag_ms
+
+
+def _diagnostics(runtime: WorkerRuntime) -> dict[str, Any]:
+    """Unauthenticated counters describing worker I/O and loop responsiveness.
+
+    Additive only. The desktop health contract validates named fields, so this
+    block cannot change how a release is accepted.
+    """
+
+    store = runtime.store
+    recent = runtime.loop_lag_recent_ms
+    runtime.loop_lag_recent_ms = 0.0
+    return {
+        "volume_manifest_reads": getattr(store, "volume_manifest_reads", None),
+        "manifest_cache_hits": getattr(store, "manifest_cache_hits", None),
+        "artifact_digest_computations": getattr(
+            runtime.controller, "artifact_digest_computations", None
+        ),
+        "loop_lag_recent_ms": round(recent, 3),
+        "loop_lag_peak_ms": round(runtime.loop_lag_peak_ms, 3),
+    }
+
+
 def _install_routes(app: FastAPI, runtime: WorkerRuntime) -> None:
     @app.get("/v1/health")
     async def health() -> dict[str, Any]:
-        return await runtime.health.snapshot(runtime.inference.gpu_snapshot())
+        payload = await runtime.health.snapshot(runtime.inference.gpu_snapshot())
+        payload["diagnostics"] = _diagnostics(runtime)
+        return payload
 
     @app.get("/v1/status", response_model=StatusResponse)
     async def status(principal: PrincipalDependency) -> StatusResponse:

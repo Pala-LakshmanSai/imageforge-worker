@@ -257,10 +257,18 @@ class FileManifestStore:
         self._active_lease_descriptor: _HeldLock | None = None
         self._submission_lease_descriptor: _HeldLock | None = None
         self._gpu_control_descriptor: _HeldLock | None = None
-        # Namespace fingerprint -> corruption verdict for the last full scan.
-        self._submission_scan_cache: (
-            tuple[tuple[tuple[str, int, int, int], ...], bool] | None
-        ) = None
+        # batch_id -> (manifest fingerprint, client submission id) proven valid
+        # for exactly those bytes. Keying per manifest rather than over the whole
+        # namespace means a live batch publishing progress only invalidates its
+        # own entry, instead of forcing every historical manifest to be re-read.
+        self._submission_identities: (
+            dict[str, tuple[tuple[int, int, int], str | None]]
+        ) = {}
+        # Diagnostics. `volume_manifest_reads` counts documents actually pulled
+        # off the network volume, so a climbing value under a steady batch means
+        # a cache is being defeated rather than merely warm.
+        self.volume_manifest_reads = 0
+        self.manifest_cache_hits = 0
         # batch_id -> (document fingerprint, raw bytes). Manifests are only ever
         # replaced atomically, so a fingerprint match proves the cached bytes
         # are still exactly what the volume holds. Only the network-volume read
@@ -640,53 +648,71 @@ class FileManifestStore:
 
         `/v1/status` is polled continuously, so the full-namespace scan cannot
         run per request: it reads and validates every manifest ever written to
-        the shared volume, which is network storage. Cache the verdict against
-        a cheap identity fingerprint of the namespace instead. Any create,
-        progress write, receipt, or external edit replaces a manifest file
-        atomically, which changes its inode/size/mtime and therefore forces a
-        rescan. The observable fail-closed contract is unchanged; only the
-        repeated I/O for an unchanged namespace is removed.
+        the shared volume, which is network storage.
+
+        Validity is a property of one manifest's bytes, so it is remembered per
+        manifest. An earlier version cached a single verdict against a
+        fingerprint of the whole namespace, which meant any one write
+        invalidated the entire cache -- and a running batch rewrites its
+        manifest on every claim, success and receipt. That cache therefore only
+        ever hit while the volume was idle, and a live batch fell back to
+        re-reading every historical manifest on every poll. Keyed per manifest,
+        a writing batch costs exactly one re-read.
+
+        The observable fail-closed contract is unchanged: any manifest whose
+        identity moved is re-read and re-validated, and enumeration or read
+        failures still report corrupt.
         """
 
         try:
-            fingerprint = self._submission_namespace_fingerprint()
+            entries = self._submission_namespace_fingerprint()
         except OSError:
-            self._submission_scan_cache = None
+            self._submission_identities = {}
             return True
-        cached = self._submission_scan_cache
-        if cached is not None and cached[0] == fingerprint:
-            return cached[1]
+        seen_submission_ids: set[str] = set()
+        validated: dict[str, tuple[tuple[int, int, int], str | None]] = {}
         try:
-            self._scan_submission_history()
-            corrupt = False
+            for batch_id, inode, size, mtime_ns in entries:
+                fingerprint = (inode, size, mtime_ns)
+                remembered = self._submission_identities.get(batch_id)
+                if remembered is not None and remembered[0] == fingerprint:
+                    submission_id = remembered[1]
+                else:
+                    _, submission = self._read_manifest_record(batch_id)
+                    submission_id = (
+                        None if submission is None else submission.client_submission_id
+                    )
+                if submission_id is not None:
+                    # A duplicate key anywhere makes every create/lookup
+                    # ambiguous, even if the caller asked about another key.
+                    if submission_id in seen_submission_ids:
+                        raise SubmissionStoreCorruptError("duplicate submission association")
+                    seen_submission_ids.add(submission_id)
+                validated[batch_id] = (fingerprint, submission_id)
         except SubmissionStoreCorruptError:
-            corrupt = True
-        # Re-fingerprint after the scan. A manifest rewritten while the scan
-        # was running must not be recorded as validated under its old identity.
-        try:
-            settled = self._submission_namespace_fingerprint()
-        except OSError:
-            self._submission_scan_cache = None
+            self._submission_identities = {}
             return True
-        self._submission_scan_cache = (settled, corrupt) if settled == fingerprint else None
-        return corrupt
+        except OSError:
+            self._submission_identities = {}
+            return True
+        self._submission_identities = validated
+        return False
 
     def _submission_namespace_fingerprint(self) -> tuple[tuple[str, int, int, int], ...]:
-        """Identify every manifest document without reading or parsing one."""
+        """Identify every manifest document without reading or parsing one.
 
-        if not self.batches_root.exists():
-            return ()
+        Enumerates through `list_batch_ids` so an unreadable batches directory
+        raises here exactly as it does for the full scan, keeping the
+        fail-closed contract on a single enumeration path.
+        """
+
         entries: list[tuple[str, int, int, int]] = []
-        for child in sorted(self.batches_root.iterdir(), key=lambda path: path.name):
-            if not child.is_dir():
-                continue
+        for batch_id in self.list_batch_ids():
             try:
-                status = os.stat(child / "manifest.json")
+                status = os.stat(self.batches_root / batch_id / "manifest.json")
             except FileNotFoundError:
                 continue
-            entries.append(
-                (child.name, status.st_ino, status.st_size, status.st_mtime_ns)
-            )
+            entries.append((batch_id, status.st_ino, status.st_size, status.st_mtime_ns))
         return tuple(entries)
 
     def _scan_submission_history(
@@ -915,7 +941,9 @@ class FileManifestStore:
         cached = self._document_cache.get(batch_id)
         if cached is not None and cached[0] == fingerprint:
             self._document_cache.move_to_end(batch_id)
+            self.manifest_cache_hits += 1
             return cached[1]
+        self.volume_manifest_reads += 1
         raw_payload = path.read_bytes()
         # Only cache when the file did not change under the read. Otherwise the
         # fingerprint would label a torn or superseded document as current.

@@ -8,6 +8,7 @@ served while that scan held the controller lock.
 
 from __future__ import annotations
 
+import os
 import uuid
 from pathlib import Path
 
@@ -107,3 +108,55 @@ async def test_status_still_fails_closed_when_history_becomes_corrupt(
         permissions = corrupted.json()["permissions"]
         assert permissions["can_create"] is False
         assert permissions["create_block_reason"] == "submission_store_corrupt"
+
+
+@pytest.mark.anyio
+async def test_status_does_not_rescan_history_while_a_batch_is_writing(
+    tmp_path: Path,
+) -> None:
+    """The namespace cache must survive an in-progress batch.
+
+    The verdict was cached against a fingerprint of the *whole* namespace, so
+    any manifest write invalidated it. During a real run the live manifest is
+    rewritten on every claim, success and receipt, which meant the cache only
+    ever hit while the volume was idle -- exactly when it does not matter.
+    Measured against a live Pod, `/v1/health` held 0.4 s idle and 12-14 s the
+    moment a batch started writing.
+    """
+    root = tmp_path / "volume"
+    store = _CountingStore(root)
+
+    async with worker_client(root, store=store) as (client, _app, _adapter):
+        for index in range(4):
+            created = await client.post(
+                "/v1/batches", json=_payload(f"history frame {index}"), headers=auth(TOKEN_A)
+            )
+            assert created.status_code == 201, created.text
+            await _drain(client, created.json()["batch_id"])
+
+        live = await client.post(
+            "/v1/batches", json=_payload("live frame"), headers=auth(TOKEN_A)
+        )
+        assert live.status_code == 201, live.text
+        live_id = live.json()["batch_id"]
+        await _drain(client, live_id)
+
+        assert (await client.get("/v1/status", headers=auth(TOKEN_A))).status_code == 200
+
+        live_manifest = root / "batches" / live_id / "manifest.json"
+        store.manifest_reads = 0
+        for tick in range(5):
+            # Stand in for the live batch publishing progress. A real write
+            # replaces this file, so its identity changes exactly like this.
+            stamp = os.stat(live_manifest).st_mtime_ns + (tick + 1) * 1_000_000
+            os.utime(live_manifest, ns=(stamp, stamp))
+            polled = await client.get("/v1/status", headers=auth(TOKEN_A))
+            assert polled.status_code == 200, polled.text
+        writing_reads = store.manifest_reads
+
+        # Only the manifest that actually changed may be re-read. Rescanning the
+        # namespace is 5 polls * 5 batches = 25 documents.
+        assert writing_reads <= 10, (
+            f"status re-read {writing_reads} manifests across 5 polls while one "
+            "batch was writing; the namespace is being rescanned per write"
+        )

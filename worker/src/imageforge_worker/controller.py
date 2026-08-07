@@ -1725,11 +1725,20 @@ class GenerationController:
     def _discover_active_locked(self, *, recover: bool) -> BatchManifest | None:
         active_manifests: list[BatchManifest] = []
         for batch_id in self.store.list_batch_ids():
-            if not recover and self._known_inactive_locked(batch_id):
-                # Observation-only discovery runs on every `/v1/status` poll.
+            if self._known_inactive_locked(batch_id):
                 # A manifest whose bytes have not changed since we last read it
                 # cannot have entered a lock-holding state, so re-reading it
                 # from the network volume can only produce the same answer.
+                #
+                # This holds for recovery too. The memo is only recorded for a
+                # batch observed outside every lock-holding state that also
+                # needed no repair, and any writer -- including another Pod --
+                # changes the fingerprint and forces the real read. Exempting
+                # recovery meant every mutation-lease acquisition rescanned the
+                # whole volume: `accept_receipts` takes and drops that lease per
+                # image once generation has finished, so each remaining ready
+                # image paid a full history scan on the event loop. A fresh
+                # process still starts with an empty memo and scans for real.
                 continue
             try:
                 manifest = self.store.load(batch_id)

@@ -8,6 +8,7 @@ served while that scan held the controller lock.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import uuid
 from pathlib import Path
@@ -160,3 +161,81 @@ async def test_status_does_not_rescan_history_while_a_batch_is_writing(
             f"status re-read {writing_reads} manifests across 5 polls while one "
             "batch was writing; the namespace is being rescanned per write"
         )
+
+
+async def _reads_to_acknowledge_three(root: Path, history: int) -> int:
+    """Acknowledge three images over `history` prior batches; return manifest reads."""
+    store = _CountingStore(root)
+    async with worker_client(root, store=store) as (client, _app, _adapter):
+        for index in range(history):
+            created = await client.post(
+                "/v1/batches", json=_payload(f"history frame {index}"), headers=auth(TOKEN_A)
+            )
+            assert created.status_code == 201, created.text
+            await _drain(client, created.json()["batch_id"])
+
+        live = await client.post(
+            "/v1/batches",
+            json={
+                "client_submission_id": str(uuid.uuid4()),
+                "prompts": ["ack frame one", "ack frame two", "ack frame three"],
+                "base_seed": 0,
+                "aspect_ratio": "16:9",
+            },
+            headers=auth(TOKEN_A),
+        )
+        assert live.status_code == 201, live.text
+        live_id = live.json()["batch_id"]
+        # Generation finished, so the mutation lease is released -- the exact
+        # state in which every remaining ready image is acknowledged.
+        await _drain(client, live_id)
+
+        artifacts = []
+        for index in (1, 2, 3):
+            got = await client.get(
+                f"/v1/batches/{live_id}/artifacts/{index}", headers=auth(TOKEN_A)
+            )
+            assert got.status_code == 200, got.text
+            artifacts.append(
+                (index, hashlib.sha256(got.content).hexdigest(), len(got.content))
+            )
+
+        store.manifest_reads = 0
+        for index, checksum, size in artifacts:
+            acknowledged = await client.post(
+                f"/v1/batches/{live_id}/receipts",
+                headers=auth(TOKEN_A),
+                json={"receipts": [{"index": index, "sha256": checksum, "size_bytes": size}]},
+            )
+            assert acknowledged.status_code == 200, acknowledged.text
+        return store.manifest_reads
+
+
+@pytest.mark.anyio
+async def test_acknowledging_receipts_does_not_rescan_history_per_image(
+    tmp_path: Path,
+) -> None:
+    """Acknowledgement cost must not grow with the volume's batch history.
+
+    `accept_receipts` takes the mutation lease and drops it again when it was
+    not already held, and taking it ran `_discover_active_locked(recover=True)`,
+    which bypassed the unchanged-manifest memo and loaded every batch on the
+    shared volume. While a batch generates, the lease stays held and downloads
+    are cheap; the moment generation finishes the lease is released and every
+    remaining ready image paid a full history scan, on the event loop, under the
+    controller lock.
+
+    Measured against a live Pod with ~38 batches on the volume: the first 23 of
+    31 images saved at ~1.4 s each, then the final 8 at ~22 s, each stall
+    showing 37-39 manifest reads and zero cache hits.
+
+    Reading a fixed number of documents per acknowledgement is fine. Reading
+    more because the studio has run more batches is the defect.
+    """
+    small = await _reads_to_acknowledge_three(tmp_path / "small", history=2)
+    large = await _reads_to_acknowledge_three(tmp_path / "large", history=10)
+
+    assert large <= small + 2, (
+        f"acknowledging 3 images read {small} manifests over 2 prior batches "
+        f"and {large} over 10; the cost is scaling with history"
+    )

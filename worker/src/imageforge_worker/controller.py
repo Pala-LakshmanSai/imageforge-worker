@@ -87,6 +87,11 @@ from .persistence import (
 
 logger = logging.getLogger("imageforge_worker.controller")
 
+# Verified artifact digests retained for re-serves and retries. Downloads are
+# sequential, so a small window covers the in-flight artifact and its retries
+# without holding the whole batch's checksums in memory.
+_ARTIFACT_DIGEST_CACHE_ENTRIES = 32
+
 
 @dataclass(frozen=True, slots=True)
 class ArtifactDescriptor:
@@ -136,6 +141,12 @@ class GenerationController:
         # Purely an I/O memo for observation-only discovery; a changed
         # fingerprint always falls back to reading the manifest.
         self._inactive_batch_fingerprints: dict[str, tuple[int, int, int]] = {}
+        # artifact path -> (stat fingerprint, sha256) proven for those bytes.
+        # A retry or re-serve of an unchanged artifact then costs a stat rather
+        # than a full network-volume read.
+        self._artifact_digests: dict[Path, tuple[tuple[int, int, int], str]] = {}
+        # Observability for tests: how many full artifact hashes were performed.
+        self.artifact_digest_computations = 0
         self.coordination = StudioCoordinator(
             clock=coordination_clock,
             finalization_ttl_seconds=coordination_finalization_ttl_seconds,
@@ -1023,12 +1034,12 @@ class GenerationController:
             already_held = self.store.active_lease_held
             await self._require_mutation_lease_locked()
             try:
-                return self._accept_receipts_locked(principal, batch_id, request)
+                return await self._accept_receipts_locked(principal, batch_id, request)
             finally:
                 if not already_held:
                     self._release_if_no_active_locked()
 
-    def _accept_receipts_locked(
+    async def _accept_receipts_locked(
         self, principal: Principal, batch_id: str, request: ReceiptRequest
     ) -> ReceiptResponse:
         manifest = self._load_owned(principal, batch_id)
@@ -1073,7 +1084,12 @@ class GenerationController:
                 size_bytes=size_bytes,
                 acknowledged_at=acknowledged_at,
             )
-        self.store.save(manifest)
+        # The manifest write lands on the RunPod network volume, where a
+        # serialize + atomic replace + fsync is slow. Running it inline blocked
+        # the event loop for the whole write, which starved generation and every
+        # other request. The controller lock is still held across this await, so
+        # no other coroutine can observe or mutate the manifest mid-write.
+        await asyncio.to_thread(self.store.save, manifest)
         return ReceiptResponse(
             batch_id=batch_id,
             accepted=[receipt.index for receipt in request.receipts],
@@ -1109,7 +1125,10 @@ class GenerationController:
                     message=f"Image {index} is not ready.",
                 )
             path = self.store.artifact_path(batch_id, relative_name)
-            if not self._file_matches(path, size, checksum):
+            # Hashing a whole JPEG off the network volume is slow. Keep it off
+            # the event loop so generation and health are not starved while a
+            # download is served; the controller lock still serialises access.
+            if not await asyncio.to_thread(self._artifact_matches, path, size, checksum):
                 raise WorkerError(
                     status_code=409,
                     code="artifact_corrupt",
@@ -1181,7 +1200,7 @@ class GenerationController:
             if image is None:
                 manifest.state = BatchState.COMPLETED
                 manifest.completed_at = utc_now()
-                self.store.save(manifest)
+                await asyncio.to_thread(self.store.save, manifest)
                 self._release_batch_lease_locked(batch_id)
                 return None
             image.status = ImageState.GENERATING
@@ -1190,7 +1209,8 @@ class GenerationController:
             image.started_at = utc_now()
             image.finished_at = None
             image.error = None
-            self.store.save(manifest)
+            # Claiming happens once per image, so this write is on the hot path.
+            await asyncio.to_thread(self.store.save, manifest)
             references = self._load_reference_images(manifest)
             return _ClaimedAttempt(
                 job=GenerationJob(
@@ -1212,14 +1232,24 @@ class GenerationController:
             image = self._find_image(manifest, claimed.job.index)
             if image.status != ImageState.GENERATING or image.attempts != claimed.attempt:
                 raise RuntimeError("generation result no longer matches its manifest attempt")
-            filename, preview_filename = self.store.write_artifacts(
-                batch_id, image.index, result.jpeg, result.preview
+            # Writing both artifacts to the network volume and hashing them is
+            # the per-image cost of generation. Run inline it blocked the event
+            # loop for every finished image, so ready artifacts could not be
+            # served while the batch kept generating. The controller lock is
+            # held across this await, so the manifest cannot move underneath it.
+            (
+                filename,
+                preview_filename,
+                jpeg_sha256,
+                preview_sha256,
+            ) = await asyncio.to_thread(
+                self._persist_generated_artifacts, batch_id, image.index, result
             )
             finished_at = utc_now()
             image.filename = filename
             image.preview_filename = preview_filename
-            image.sha256 = hashlib.sha256(result.jpeg).hexdigest()
-            image.preview_sha256 = hashlib.sha256(result.preview).hexdigest()
+            image.sha256 = jpeg_sha256
+            image.preview_sha256 = preview_sha256
             image.size_bytes = len(result.jpeg)
             image.preview_size_bytes = len(result.preview)
             image.generation_ms = (
@@ -1242,9 +1272,28 @@ class GenerationController:
                 )
             )
             # Artifact writes and hashes are durable before this manifest publishes readiness.
-            self.store.save(manifest)
+            await asyncio.to_thread(self.store.save, manifest)
             if self._switch_inflight_index == image.index:
                 self._switch_inflight_index = None
+
+    def _persist_generated_artifacts(
+        self, batch_id: str, index: int, result: InferenceResult
+    ) -> tuple[str, str, str, str]:
+        """Write both artifacts to the volume and hash them, off the event loop.
+
+        Returns the stored filenames alongside their digests so the caller can
+        publish them without repeating any volume read. Callers hold the
+        controller lock.
+        """
+        filename, preview_filename = self.store.write_artifacts(
+            batch_id, index, result.jpeg, result.preview
+        )
+        return (
+            filename,
+            preview_filename,
+            hashlib.sha256(result.jpeg).hexdigest(),
+            hashlib.sha256(result.preview).hexdigest(),
+        )
 
     async def _record_failure(
         self, batch_id: str, claimed: _ClaimedAttempt, error_code: str
@@ -2183,15 +2232,42 @@ class GenerationController:
                     raise InferenceFailure("invalid_inference_artifact")
                 image.verify()
 
-    @staticmethod
-    def _file_matches(path: Path, size: int, checksum: str) -> bool:
+    def _artifact_matches(self, path: Path, size: int, checksum: str) -> bool:
+        """Verify a stored artifact, reusing the last verdict for an unchanged file.
+
+        Artifacts are written once and never edited in place, so an unchanged
+        `(st_ino, st_size, st_mtime_ns)` proves the bytes still hash to the value
+        computed before. Only the re-read is elided; the checksum comparison
+        itself still runs on every call, so a mismatch remains fail-closed.
+
+        Runs on a worker thread. Callers hold the controller lock.
+        """
         try:
-            if path.stat().st_size != size:
-                return False
-            digest = hashlib.sha256()
+            stat = path.stat()
+        except FileNotFoundError:
+            self._artifact_digests.pop(path, None)
+            return False
+        if stat.st_size != size:
+            return False
+        fingerprint = (stat.st_ino, stat.st_size, stat.st_mtime_ns)
+        cached = self._artifact_digests.get(path)
+        if cached is not None and cached[0] == fingerprint:
+            return secrets.compare_digest(cached[1], checksum)
+        self.artifact_digest_computations += 1
+        digest = hashlib.sha256()
+        try:
             with path.open("rb") as handle:
                 for chunk in iter(lambda: handle.read(1024 * 1024), b""):
                     digest.update(chunk)
-            return secrets.compare_digest(digest.hexdigest(), checksum)
+            after = path.stat()
         except FileNotFoundError:
+            self._artifact_digests.pop(path, None)
             return False
+        hexdigest = digest.hexdigest()
+        # Only cache a digest proven to describe a file that did not change
+        # underneath the read, so a torn or replaced artifact is never latched.
+        if (after.st_ino, after.st_size, after.st_mtime_ns) == fingerprint:
+            if len(self._artifact_digests) >= _ARTIFACT_DIGEST_CACHE_ENTRIES:
+                self._artifact_digests.clear()
+            self._artifact_digests[path] = (fingerprint, hexdigest)
+        return secrets.compare_digest(hexdigest, checksum)

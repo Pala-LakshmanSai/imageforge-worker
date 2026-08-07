@@ -90,8 +90,28 @@ async def test_450_prompt_ordered_run_pauses_survives_new_pod_and_completes(
     assert [image["filename"] for image in final["images"]] == [
         f"artifacts/{index:06d}.jpg" for index in range(1, 451)
     ]
-    assert first_adapter.generated_indices + replacement_adapter.generated_indices == list(
-        range(1, 451)
+    # The first worker is torn down abruptly, mid-run, on purpose -- that is what
+    # produces the `interrupted` state asserted above. Whichever image is being
+    # generated at that instant has no recorded success, so the replacement
+    # correctly regenerates it. Requiring the two adapters to concatenate into a
+    # gapless 1..450 therefore asserted that no work was ever in flight at
+    # shutdown, which only held because a local SSD finishes a manifest write
+    # faster than the scheduler can start the next image. On the RunPod network
+    # volume that write is far slower, so the strict form encoded an assumption
+    # that is false on the deployment target.
+    #
+    # Pin what actually matters instead: every prompt is generated, each worker
+    # generates in order, and an abrupt stop costs at most the single in-flight
+    # image -- never a silently dropped or wholesale-repeated range.
+    combined = first_adapter.generated_indices + replacement_adapter.generated_indices
+    assert set(combined) == set(range(1, 451))
+    assert first_adapter.generated_indices == sorted(first_adapter.generated_indices)
+    assert replacement_adapter.generated_indices == sorted(
+        replacement_adapter.generated_indices
+    )
+    assert len(combined) - len(set(combined)) <= 1, (
+        "an abrupt stop may only cost the one in-flight image; "
+        f"{len(combined) - len(set(combined))} images were regenerated"
     )
     for image in final["images"]:
         path = volume / "batches" / batch_id / image["filename"]

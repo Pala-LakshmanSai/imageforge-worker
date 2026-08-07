@@ -1,7 +1,7 @@
 from typing import Final
 
 API_SCHEMA_VERSION: Final = 1
-WORKER_VERSION: Final = "0.1.4"
+WORKER_VERSION: Final = "0.1.5"
 
 MODEL_ID: Final = "black-forest-labs/FLUX.2-klein-4B"
 MODEL_REVISION: Final = "e7b7dc27f91deacad38e78976d1f2b499d76a294"

@@ -13,8 +13,10 @@ import pytest
 from conftest import TOKEN_A, TOKEN_B, auth, wait_for_batch, worker_client
 from PIL import Image
 
+from imageforge_worker import controller as controller_module
 from imageforge_worker.constants import MAX_SEED
 from imageforge_worker.inference import FakeInferenceAdapter
+from imageforge_worker.model_profiles import FLUX2_KLEIN
 from imageforge_worker.persistence import FileManifestStore, SubmissionStoreCorruptError
 
 
@@ -82,6 +84,17 @@ async def _request_stop(client, session_id: str) -> dict:  # type: ignore[no-unt
     )
     assert response.status_code == 201, response.text
     return response.json()
+
+
+@pytest.fixture
+def reference_capable_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Run the reference plumbing against a model that accepts references.
+
+    The shipped model is text-to-image only, but the reference path still ships
+    for the FLUX backend, so it keeps its coverage rather than being deleted.
+    """
+
+    monkeypatch.setattr(controller_module, "ACTIVE_PROFILE", FLUX2_KLEIN)
 
 
 @pytest.mark.anyio
@@ -204,7 +217,9 @@ async def test_first_replay_fingerprint_and_owner_only_lookup_are_exact(tmp_path
 
 
 @pytest.mark.anyio
-async def test_fingerprint_binds_decoded_reference_hashes_and_all_settings(tmp_path: Path) -> None:
+async def test_fingerprint_binds_decoded_reference_hashes_and_all_settings(
+    tmp_path: Path, reference_capable_model: None
+) -> None:
     buffer = io.BytesIO()
     Image.new("RGB", (12, 8), "teal").save(buffer, format="PNG")
     raw_reference = buffer.getvalue()

@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .constants import MAX_GENERATION_ATTEMPTS, MODEL_ID, MODEL_REVISION
+from .model_profiles import supported_backends
 
 _USER_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 BEARER_TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9._~+/\-]+=*$")
@@ -41,7 +42,8 @@ class WorkerSettings:
     data_root: Path
     model_cache_dir: Path
     credentials: tuple[Credential, ...]
-    inference_backend: str = "flux"
+    comfyui_root: Path = Path("/opt/comfyui")
+    inference_backend: str = "mageflow"
     allow_fake_inference: bool = False
     fsync_writes: bool = True
     retry_delay_seconds: float = 0.25
@@ -57,8 +59,11 @@ class WorkerSettings:
             raise ValueError("worker credential user IDs must be unique")
         if len({item.token for item in self.credentials}) != len(self.credentials):
             raise ValueError("worker bearer credentials must be unique")
-        if self.inference_backend not in {"flux", "fake"}:
-            raise ValueError("inference backend must be 'flux' or 'fake'")
+        if self.inference_backend not in {*supported_backends(), "fake"}:
+            raise ValueError(
+                "inference backend must be one of "
+                f"{', '.join(sorted({*supported_backends(), 'fake'}))}"
+            )
         if self.inference_backend == "fake" and not self.allow_fake_inference:
             raise ValueError("fake inference requires IMAGEFORGE_ALLOW_FAKE_INFERENCE=1")
         if self.max_generation_attempts != MAX_GENERATION_ATTEMPTS:
@@ -72,7 +77,7 @@ class WorkerSettings:
     def from_env(cls, environ: Mapping[str, str] | None = None) -> WorkerSettings:
         env = os.environ if environ is None else environ
         credentials = _parse_credentials(env.get("IMAGEFORGE_AUTH_TOKENS_JSON", ""))
-        backend = env.get("IMAGEFORGE_INFERENCE_BACKEND", "flux").strip().lower()
+        backend = env.get("IMAGEFORGE_INFERENCE_BACKEND", "mageflow").strip().lower()
         metadata_keys = (
             "RUNPOD_POD_ID",
             "RUNPOD_DC_ID",
@@ -95,6 +100,7 @@ class WorkerSettings:
             model_cache_dir=Path(
                 env.get("IMAGEFORGE_MODEL_CACHE_DIR", "/workspace/models/huggingface")
             ),
+            comfyui_root=Path(env.get("IMAGEFORGE_COMFYUI_ROOT", "/opt/comfyui")),
             credentials=credentials,
             inference_backend=backend,
             allow_fake_inference=_parse_bool(env.get("IMAGEFORGE_ALLOW_FAKE_INFERENCE", "0")),

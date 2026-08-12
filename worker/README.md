@@ -9,8 +9,8 @@ never creates, stops, or terminates a Pod.
 ## Runtime contract
 
 - API schema: `1`
-- model: `black-forest-labs/FLUX.2-klein-4B`
-- model revision: `e7b7dc27f91deacad38e78976d1f2b499d76a294`
+- model: `Comfy-Org/Mage-Flow`
+- model revision: `d8c99241f6fa80fbd453014234af2bf337ea21e6`
 - precision: BF16, loaded directly onto one NVIDIA CUDA 13.0+ device with at least 16,380 MiB VRAM
 - output: 1280x720 JPEG quality 95 and 320x180 WebP preview
 - inference: four steps, guidance 1.0
@@ -22,10 +22,11 @@ never creates, stops, or terminates a Pod.
 - references: optional batch-level JPEG, PNG, or WebP images (up to 8 files,
   8 MiB each and 32 MiB total); manifests retain only safe metadata and checksums
 
-The pinned Python 3.11 slim image plus the SHA-256-pinned `torch==2.13.0+cu130`
+The pinned Python 3.11 slim image plus the SHA-256-pinned `torch==2.11.0+cu130`
 wheel supports the approved Ampere, Ada, and Blackwell families; RunPod supplies
 the host NVIDIA driver. The Docker base image, Python minor version, direct
-dependencies, PyTorch wheel, Diffusers, model revision, and schema are pinned.
+dependencies, PyTorch wheel, ComfyUI revision, model revision, and schema are
+pinned.
 The production adapter uses
 `local_files_only=True` while all Hugging Face offline flags are set. Model
 weights must be provisioned once onto `/workspace/models/huggingface` before a
@@ -34,19 +35,25 @@ normal start. Boot never installs packages and never downloads weights.
 For the separately authorized one-time volume preparation, run:
 
 ```sh
-python -m imageforge_worker.prepare_model \
+python worker/scripts/prepare_mageflow_volume.py \
   --cache-dir /workspace/models/huggingface \
   --confirm-download
 ```
 
 `--confirm-download` temporarily disables only `HF_HUB_OFFLINE` inside that
 preparation process and restores it afterward. Normal worker boot always remains
-offline. The command pins the same model revision and downloads only `model_index.json`
-plus `scheduler/`, `text_encoder/`, `tokenizer/`, `transformer/`, and `vae/`.
-It intentionally excludes the redundant root `flux-2-klein-4b.safetensors`
-(which duplicates the Diffusers transformer) and repository sample images. The
-required runtime tree is approximately 16 GB rather than the roughly 23.74 GB
-full repository, leaving safe working room on the 50 GB EU-RO-1 network volume.
+offline. The command pins the model revision and downloads the three files the
+worker needs: the INT8 ConvRot transformer (4.16 GB), the Qwen3-VL-4B text
+encoder (8.88 GB), and the Mage-VAE (0.35 GB), roughly 13.4 GB in total on the
+50 GB EU-RO-1 network volume. Pass `--include-bf16-fallback` to add the 8.23 GB
+BF16 transformer, which the `mageflow-bf16` backend uses.
+
+Weights come from the public `Comfy-Org/Mage-Flow` mirror. The upstream
+`microsoft/Mage-Flow*` repositories are gated and return HTTP 401 without an
+accepted licence, and Diffusers cannot load Mage-Flow in any case, so the worker
+drives a pinned, loopback-only ComfyUI child process instead. See
+`docs/MAGEFLOW_STAGING.md`.
+
 This preparation command is never invoked by the Docker entrypoint.
 
 GPU family selection remains the desktop/RunPod provider's responsibility. The

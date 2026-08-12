@@ -53,7 +53,13 @@ from .gpu_switch_models import (
     WorkerGpuSwitchRuntimeIdentityV1,
 )
 from .health import HealthTracker
-from .inference import FakeInferenceAdapter, FluxInferenceAdapter, InferenceAdapter
+from .inference import (
+    FakeInferenceAdapter,
+    FluxInferenceAdapter,
+    InferenceAdapter,
+    MageFlowInferenceAdapter,
+)
+from .model_profiles import profile_for_backend
 from .persistence import FileManifestStore, ManifestStore
 
 logger = logging.getLogger("imageforge_worker.app")
@@ -207,7 +213,13 @@ async def _boot(runtime: WorkerRuntime) -> None:
 def _build_inference(settings: WorkerSettings) -> InferenceAdapter:
     if settings.inference_backend == "fake":
         return FakeInferenceAdapter()
-    return FluxInferenceAdapter(settings.model_cache_dir)
+    if settings.inference_backend == "flux":
+        return FluxInferenceAdapter(settings.model_cache_dir)
+    return MageFlowInferenceAdapter(
+        settings.model_cache_dir,
+        settings.comfyui_root,
+        profile_for_backend(settings.inference_backend),
+    )
 
 
 async def _monitor_loop_lag(runtime: WorkerRuntime, tick: float = 0.05) -> None:

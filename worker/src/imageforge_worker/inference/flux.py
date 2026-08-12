@@ -1,12 +1,9 @@
 from __future__ import annotations
 
 import asyncio
-import io
 import time
 from pathlib import Path
 from typing import Any
-
-from PIL import Image
 
 from ..constants import (
     MIN_CUDA_VERSION,
@@ -19,6 +16,7 @@ from ..constants import (
 )
 from ..domain import GenerationSettings, HealthPhase
 from .base import GenerationJob, InferenceResult, PhaseReporter
+from .encoding import encode_result
 
 
 class FluxInferenceAdapter:
@@ -136,35 +134,7 @@ class FluxInferenceAdapter:
         torch.cuda.synchronize()
         inference_ms = (time.perf_counter() - inference_started) * 1000
 
-        image = image.convert("RGB")
-        if image.size != (job.settings.width, job.settings.height):
-            raise RuntimeError("FLUX returned an unexpected image size")
-        jpeg_started = time.perf_counter()
-        jpeg_buffer = io.BytesIO()
-        image.save(
-            jpeg_buffer,
-            format="JPEG",
-            quality=job.settings.jpeg_quality,
-            optimize=False,
-            progressive=False,
-            subsampling=0,
-        )
-        jpeg_encode_ms = (time.perf_counter() - jpeg_started) * 1000
-
-        preview_started = time.perf_counter()
-        preview: Image.Image = image.resize(
-            (job.settings.preview_width, job.settings.preview_height), Image.Resampling.LANCZOS
-        )
-        preview_buffer = io.BytesIO()
-        preview.save(preview_buffer, format="WEBP", quality=85, method=4, exact=True)
-        preview_encode_ms = (time.perf_counter() - preview_started) * 1000
-        return InferenceResult(
-            jpeg=jpeg_buffer.getvalue(),
-            preview=preview_buffer.getvalue(),
-            inference_ms=inference_ms,
-            jpeg_encode_ms=jpeg_encode_ms,
-            preview_encode_ms=preview_encode_ms,
-        )
+        return encode_result(image, job.settings, inference_ms)
 
     async def shutdown(self) -> None:
         pipeline = self._pipeline

@@ -77,6 +77,7 @@ from .gpu_switch_models import (
     WorkerGpuSwitchRuntimeIdentityV1,
 )
 from .inference import GenerationJob, InferenceAdapter, InferenceResult
+from .model_profiles import ACTIVE_PROFILE
 from .persistence import (
     ManifestStore,
     SharedGpuStopGuard,
@@ -426,9 +427,7 @@ class GenerationController:
             return self._project_shared_stop_guard_locked(response).model_copy(
                 update={
                     "gpu_switch_request": switch_view,
-                    "gpu_switch_can_respond": self.gpu_switch.can_respond(
-                        principal, session_id
-                    )
+                    "gpu_switch_can_respond": self.gpu_switch.can_respond(principal, session_id)
                     if switch_view is not None
                     else False,
                 }
@@ -455,9 +454,7 @@ class GenerationController:
             return self._project_shared_stop_guard_locked(response).model_copy(
                 update={
                     "gpu_switch_request": switch_view,
-                    "gpu_switch_can_respond": self.gpu_switch.can_respond(
-                        principal, session_id
-                    )
+                    "gpu_switch_can_respond": self.gpu_switch.can_respond(principal, session_id)
                     if switch_view is not None
                     else False,
                 }
@@ -1485,9 +1482,7 @@ class GenerationController:
         return self._project_shared_stop_guard_locked(response).model_copy(
             update={
                 "gpu_switch_request": switch_view,
-                "gpu_switch_can_respond": self.gpu_switch.can_respond(
-                    principal, session_id
-                )
+                "gpu_switch_can_respond": self.gpu_switch.can_respond(principal, session_id)
                 if switch_view is not None
                 else False,
             }
@@ -2139,6 +2134,16 @@ class GenerationController:
 
     @staticmethod
     def _prepare_references(references: list[ReferenceInput]) -> list[_PreparedReference]:
+        if references and not ACTIVE_PROFILE.supports_references:
+            # Refuse at submission rather than after the batch is committed: the
+            # active model is text-to-image only, so every image would fail.
+            raise WorkerError(
+                status_code=422,
+                code="references_unsupported",
+                message=(
+                    "The active model is text-to-image only and does not accept reference images."
+                ),
+            )
         prepared: list[_PreparedReference] = []
         extensions = {"image/jpeg": "jpg", "image/png": "png", "image/webp": "webp"}
         for index, reference in enumerate(references, start=1):

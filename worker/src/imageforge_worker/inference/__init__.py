@@ -1,6 +1,7 @@
 from .base import GenerationJob, InferenceAdapter, InferenceResult
 from .fake import FakeInferenceAdapter
 from .flux import FluxInferenceAdapter
+from .mageflow import MageFlowInferenceAdapter
 
 __all__ = [
     "FakeInferenceAdapter",
@@ -8,4 +9,5 @@ __all__ = [
     "GenerationJob",
     "InferenceAdapter",
     "InferenceResult",
+    "MageFlowInferenceAdapter",
 ]

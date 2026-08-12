@@ -160,7 +160,7 @@ async def verify_identity(
     if mismatches:
         raise RuntimeError(f"Worker {label} identity mismatch: {mismatches}")
     model = health.get("model")
-    if not isinstance(model, dict) or model.get("id") != "black-forest-labs/FLUX.2-klein-4B":
+    if not isinstance(model, dict) or model.get("id") != "Comfy-Org/Mage-Flow":
         raise RuntimeError(f"Worker {label} reported an unexpected model")
 
 

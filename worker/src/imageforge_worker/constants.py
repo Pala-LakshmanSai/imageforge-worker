@@ -1,11 +1,11 @@
 from typing import Final
 
 API_SCHEMA_VERSION: Final = 1
-WORKER_VERSION: Final = "0.1.7"
+WORKER_VERSION: Final = "0.2.0"
 
-MODEL_ID: Final = "black-forest-labs/FLUX.2-klein-4B"
-MODEL_REVISION: Final = "e7b7dc27f91deacad38e78976d1f2b499d76a294"
-MODEL_PRECISION: Final = "bfloat16"
+MODEL_ID: Final = "Comfy-Org/Mage-Flow"
+MODEL_REVISION: Final = "d8c99241f6fa80fbd453014234af2bf337ea21e6"
+MODEL_PRECISION: Final = "int8-convrot"
 
 OUTPUT_WIDTH: Final = 1280
 OUTPUT_HEIGHT: Final = 720

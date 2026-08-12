@@ -12,13 +12,26 @@ import pytest
 from conftest import TOKEN_A, TOKEN_B, auth, wait_for_batch, worker_client
 from PIL import Image
 
+from imageforge_worker import controller as controller_module
 from imageforge_worker.inference import FakeInferenceAdapter
+from imageforge_worker.model_profiles import FLUX2_KLEIN
 
 
 def _encoded_image(image_format: str, size: tuple[int, int], color: str) -> str:
     payload = io.BytesIO()
     Image.new("RGB", size, color).save(payload, format=image_format)
     return payload.getvalue().hex()
+
+
+@pytest.fixture
+def reference_capable_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Run the reference plumbing against a model that accepts references.
+
+    The shipped model is text-to-image only, but the reference path still ships
+    for the FLUX backend, so it keeps its coverage rather than being deleted.
+    """
+
+    monkeypatch.setattr(controller_module, "ACTIVE_PROFILE", FLUX2_KLEIN)
 
 
 @pytest.mark.anyio
@@ -137,6 +150,7 @@ async def test_aspect_ratio_is_persisted_and_controls_encoded_dimensions(tmp_pat
 @pytest.mark.anyio
 async def test_batch_references_are_decoded_forwarded_and_persisted_without_raw_bytes(
     tmp_path: Path,
+    reference_capable_model: None,
 ) -> None:
     adapter = FakeInferenceAdapter()
     first_data = _encoded_image("PNG", (32, 24), "red")
@@ -180,7 +194,9 @@ async def test_batch_references_are_decoded_forwarded_and_persisted_without_raw_
 
 
 @pytest.mark.anyio
-async def test_batch_reference_validation_rejects_mismatch_and_non_images(tmp_path: Path) -> None:
+async def test_batch_reference_validation_rejects_mismatch_and_non_images(
+    tmp_path: Path, reference_capable_model: None
+) -> None:
     async with worker_client(tmp_path / "volume") as (client, _, _):
         malformed = await client.post(
             "/v1/batches",

@@ -79,6 +79,7 @@ from .gpu_switch_models import (
 from .inference import GenerationJob, InferenceAdapter, InferenceResult
 from .model_profiles import ACTIVE_PROFILE
 from .persistence import (
+    ActiveBatchIndexCorruptError,
     ManifestStore,
     SharedGpuStopGuard,
     SubmissionMatch,
@@ -142,6 +143,10 @@ class GenerationController:
         # Purely an I/O memo for observation-only discovery; a changed
         # fingerprint always falls back to reading the manifest.
         self._inactive_batch_fingerprints: dict[str, tuple[int, int, int]] = {}
+        # Completed artifacts were historically verified once during boot.
+        # Fast boot defers that work until first access, then preserves the same
+        # once-per-process behavior rather than rehashing a batch on every poll.
+        self._terminal_recovery_checked: set[str] = set()
         # artifact path -> (stat fingerprint, sha256) proven for those bytes.
         # A retry or re-serve of an unchanged artifact then costs a stat rather
         # than a full network-volume read.
@@ -829,6 +834,10 @@ class GenerationController:
                     progress=BatchProgress(total=len(images)),
                 )
                 try:
+                    # Publish intent before the active manifest can become visible.
+                    # A crash here leaves a stale pointer that boot repairs by scan;
+                    # the inverse ordering could hide active work and admit a second.
+                    self.store.write_active_batch_index(batch_id)
                     self.store.create(
                         manifest,
                         reference_payloads=[
@@ -859,7 +868,45 @@ class GenerationController:
     async def get_batch(self, principal: Principal, batch_id: str) -> BatchManifest:
         self._ensure_initialized()
         async with self._lock:
-            return self._load_owned(principal, batch_id)
+            manifest = self._load_owned(principal, batch_id)
+            if (
+                manifest.state != BatchState.COMPLETED
+                or batch_id in self._terminal_recovery_checked
+            ):
+                return manifest
+
+            # Terminal history is intentionally absent from cold-boot recovery.
+            # Verify artifacts lazily when that batch is actually requested.
+            active = self._refresh_active_observation_locked()
+            if (
+                active is not None
+                or self._stop_guard is not None
+                or self._switch_requires_lease_locked()
+            ):
+                return manifest
+            already_held = self.store.active_lease_held
+            await self._require_mutation_lease_locked()
+            try:
+                active = self._refresh_active_observation_locked()
+                if (
+                    active is not None
+                    or self._stop_guard is not None
+                    or self._switch_requires_lease_locked()
+                ):
+                    return manifest
+                manifest = self._load_owned(principal, batch_id)
+                if manifest.state == BatchState.COMPLETED and self._recover_manifest(manifest):
+                    # Recovery can turn completed work back into interrupted work;
+                    # publish intent first so a crash cannot hide an active batch.
+                    self.store.write_active_batch_index(batch_id)
+                    self.store.save(manifest)
+                    self._active_batch_id = batch_id
+                else:
+                    self._terminal_recovery_checked.add(batch_id)
+                return manifest
+            finally:
+                if not already_held:
+                    self._release_if_no_active_locked()
 
     async def get_submission(
         self, principal: Principal, client_submission_id: str
@@ -930,6 +977,7 @@ class GenerationController:
             manifest.interrupted_at = None
             manifest.pause_requested = False
             manifest.cancel_requested = False
+            self.store.write_active_batch_index(batch_id)
             self.store.save(manifest)
             self._active_batch_id = batch_id
             self._launch_runner_locked(batch_id)
@@ -968,6 +1016,7 @@ class GenerationController:
             else:
                 self._finalize_cancel(manifest)
                 self.store.save(manifest)
+                self.store.write_active_batch_index(None)
                 self._release_batch_lease_locked(batch_id)
             return manifest
 
@@ -1017,6 +1066,7 @@ class GenerationController:
             manifest.interrupted_at = None
             manifest.pause_requested = False
             manifest.cancel_requested = False
+            self.store.write_active_batch_index(batch_id)
             self.store.save(manifest)
             self._active_batch_id = batch_id
             self._launch_runner_locked(batch_id)
@@ -1198,6 +1248,7 @@ class GenerationController:
                 manifest.state = BatchState.COMPLETED
                 manifest.completed_at = utc_now()
                 await asyncio.to_thread(self.store.save, manifest)
+                self.store.write_active_batch_index(None)
                 self._release_batch_lease_locked(batch_id)
                 return None
             image.status = ImageState.GENERATING
@@ -1384,6 +1435,7 @@ class GenerationController:
                 manifest.cancel_requested = False
                 manifest.completed_at = utc_now()
                 self.store.save(manifest)
+                self.store.write_active_batch_index(None)
             finally:
                 self._release_batch_lease_locked(batch_id)
 
@@ -1718,8 +1770,37 @@ class GenerationController:
         )
 
     def _discover_active_locked(self, *, recover: bool) -> BatchManifest | None:
+        """Use the durable pointer; scan historical manifests only to repair it."""
+
+        try:
+            indexed_batch_id = self.store.read_active_batch_index()
+        except (FileNotFoundError, ActiveBatchIndexCorruptError):
+            return self._scan_and_repair_active_index_locked(recover=recover)
+
+        if indexed_batch_id is None:
+            return None
+
+        try:
+            manifest = self.store.load(indexed_batch_id)
+        except (FileNotFoundError, ValueError, SubmissionStoreCorruptError):
+            return self._scan_and_repair_active_index_locked(recover=recover)
+
+        changed = self._recover_manifest(manifest) if recover else False
+        if changed:
+            self.store.save(manifest)
+        if manifest.state in LOCK_HOLDING_STATES:
+            return manifest
+
+        # Expected after a crash between terminal manifest persistence and
+        # clearing the pointer. Scan once before publishing no-active state.
+        return self._scan_and_repair_active_index_locked(recover=recover)
+
+    def _scan_and_repair_active_index_locked(
+        self, *, recover: bool
+    ) -> BatchManifest | None:
         active_manifests: list[BatchManifest] = []
-        for batch_id in self.store.list_batch_ids():
+        batch_ids = self.store.list_batch_ids()
+        for batch_id in batch_ids:
             if self._known_inactive_locked(batch_id):
                 # A manifest whose bytes have not changed since we last read it
                 # cannot have entered a lock-holding state, so re-reading it
@@ -1751,7 +1832,11 @@ class GenerationController:
                 self.store.save(manifest)
         if len(active_manifests) > 1:
             raise RuntimeError("persistent volume contains multiple active batch leases")
-        return active_manifests[0] if active_manifests else None
+        active = active_manifests[0] if active_manifests else None
+        self.store.publish_submission_index_if_complete(batch_ids)
+        if self.store.active_lease_held:
+            self.store.write_active_batch_index(active.batch_id if active is not None else None)
+        return active
 
     def _known_inactive_locked(self, batch_id: str) -> bool:
         remembered = self._inactive_batch_fingerprints.get(batch_id)

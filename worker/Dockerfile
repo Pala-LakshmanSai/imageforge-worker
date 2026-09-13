@@ -4,7 +4,7 @@
 # runtime inside the pinned PyTorch wheel instead of inheriting the PyTorch
 # image: the current image tag contains Python 3.12, while the worker contract
 # is Python 3.11.  This also makes the build reproducible on GitHub Actions.
-FROM python:3.11-slim-bookworm@sha256:28255a3ace7eb4c48bc1b57b90af29e1bc82b4fd6c60614a8e3dce61b87ff941
+FROM python:3.11-slim-bookworm@sha256:28255a3ace7eb4c48bc1b57b90af29e1bc82b4fd6c60614a8e3dce61b87ff941 AS base
 
 LABEL org.opencontainers.image.title="ImageForge Worker" \
       org.opencontainers.image.version="0.2.0" \
@@ -31,6 +31,8 @@ ENV PYTHONUNBUFFERED=1 \
     IMAGEFORGE_COMFYUI_ROOT=/opt/comfyui
 
 WORKDIR /opt/imageforge-worker
+
+FROM base AS builder
 
 COPY scripts/verify_comfyui_nodes.py ./verify_comfyui_nodes.py
 
@@ -84,6 +86,21 @@ COPY src ./src
 
 RUN python -m pip install --no-cache-dir '.[gpu]' \
     && python -m pip check
+
+FROM base AS runtime
+
+# Compiler headers and Git are build-only. Keep the shared libraries required
+# by PyTorch, Pillow, OpenCV/ComfyUI, and CUDA NUMA discovery in the final image.
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends \
+      libgomp1 \
+      libglib2.0-0 \
+      libgl1 \
+      libnuma1 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /usr/local /usr/local
+COPY --from=builder /opt/comfyui /opt/comfyui
 
 EXPOSE 8000
 HEALTHCHECK --interval=5s --timeout=3s --start-period=300s --retries=60 \

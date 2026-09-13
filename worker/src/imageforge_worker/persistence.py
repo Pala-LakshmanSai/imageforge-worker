@@ -39,6 +39,12 @@ MINIMUM_RETENTION = timedelta(hours=24)
 _WINDOWS_PRESENCE_SLOTS = 256
 _GPU_STOP_GUARD_FILENAME = ".gpu-stop-finalization.json"
 _MAX_GPU_STOP_GUARD_BYTES = 2048
+_ACTIVE_BATCH_INDEX_FILENAME = ".active-batch.json"
+_MAX_ACTIVE_BATCH_INDEX_BYTES = 512
+_ACTIVE_BATCH_INDEX_SCHEMA_VERSION = 1
+_SUBMISSION_INDEX_FILENAME = ".submission-index.json"
+_MAX_SUBMISSION_INDEX_BYTES = 4 * 1024 * 1024
+_SUBMISSION_INDEX_SCHEMA_VERSION = 1
 _POD_ID_PATTERN = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,56}[A-Za-z0-9])?$")
 _MANIFEST_ENVELOPE_SCHEMA_VERSION = 2
 # Enough to keep the active batch plus a peer read hot without holding whole
@@ -54,6 +60,56 @@ class SubmissionStoreCorruptError(RuntimeError):
     Keeping the storage exception distinct avoids accidentally treating a bad
     envelope as a missing submission and creating another remote batch.
     """
+
+
+class ActiveBatchIndexCorruptError(RuntimeError):
+    """The durable active-batch index cannot safely be trusted."""
+
+
+class ActiveBatchIndex(StrictModel):
+    """Small crash-safe pointer used to avoid parsing historical manifests."""
+
+    schema_version: Literal[_ACTIVE_BATCH_INDEX_SCHEMA_VERSION] = (
+        _ACTIVE_BATCH_INDEX_SCHEMA_VERSION
+    )
+    batch_id: str | None = None
+
+    @field_validator("batch_id")
+    @classmethod
+    def validate_batch_id(cls, value: str | None) -> str | None:
+        if value is not None:
+            require_canonical_uuid4(value)
+        return value
+
+
+class SubmissionIndexEntry(StrictModel):
+    batch_id: str
+    inode: int = Field(ge=0)
+    size: int = Field(ge=0)
+    mtime_ns: int = Field(ge=0)
+    client_submission_id: str | None = None
+
+    @field_validator("batch_id")
+    @classmethod
+    def validate_batch_id(cls, value: str) -> str:
+        require_canonical_uuid4(value)
+        return value
+
+    @field_validator("client_submission_id")
+    @classmethod
+    def validate_submission_id(cls, value: str | None) -> str | None:
+        if value is not None:
+            require_canonical_uuid4(value)
+        return value
+
+
+class SubmissionIndex(StrictModel):
+    """Non-authoritative fingerprints that avoid rereading unchanged history."""
+
+    schema_version: Literal[_SUBMISSION_INDEX_SCHEMA_VERSION] = (
+        _SUBMISSION_INDEX_SCHEMA_VERSION
+    )
+    entries: list[SubmissionIndexEntry] = Field(default_factory=list)
 
 
 class SubmissionRecord(StrictModel):
@@ -200,6 +256,12 @@ class ManifestStore(Protocol):
 
     def clear_stale_gpu_stop_guard(self) -> None: ...
 
+    def read_active_batch_index(self) -> str | None: ...
+
+    def write_active_batch_index(self, batch_id: str | None) -> None: ...
+
+    def publish_submission_index_if_complete(self, batch_ids: list[str]) -> None: ...
+
     def list_batch_ids(self) -> list[str]: ...
 
     def create(
@@ -264,6 +326,9 @@ class FileManifestStore:
         self._submission_identities: (
             dict[str, tuple[tuple[int, int, int], str | None]]
         ) = {}
+        self._persisted_submission_identities: (
+            dict[str, tuple[tuple[int, int, int], str | None]]
+        ) = {}
         # Diagnostics. `volume_manifest_reads` counts documents actually pulled
         # off the network volume, so a climbing value under a steady batch means
         # a cache is being defeated rather than merely warm.
@@ -295,6 +360,105 @@ class FileManifestStore:
         self._atomic_write(probe, b"imageforge-storage-probe\n")
         probe.unlink(missing_ok=True)
         self._fsync_directory(self.root)
+        self._load_submission_index()
+
+    def read_active_batch_index(self) -> str | None:
+        """Read the durable active pointer; missing/corrupt means scan required."""
+
+        path = self.root / _ACTIVE_BATCH_INDEX_FILENAME
+        try:
+            if path.stat().st_size > _MAX_ACTIVE_BATCH_INDEX_BYTES:
+                raise ActiveBatchIndexCorruptError("active batch index is too large")
+            payload = path.read_bytes()
+            return ActiveBatchIndex.model_validate_json(payload).batch_id
+        except FileNotFoundError:
+            raise
+        except (OSError, ValidationError, ValueError) as exc:
+            raise ActiveBatchIndexCorruptError("active batch index is invalid") from exc
+
+    def write_active_batch_index(self, batch_id: str | None) -> None:
+        """Atomically publish the active batch, or a durable no-active sentinel."""
+
+        self._require_active_lease()
+        index = ActiveBatchIndex(batch_id=batch_id)
+        payload = json.dumps(
+            index.model_dump(mode="json"), separators=(",", ":"), sort_keys=True
+        ).encode("utf-8")
+        self._atomic_write(
+            self.root / _ACTIVE_BATCH_INDEX_FILENAME,
+            payload,
+            after_file_sync="after_active_index_fsync",
+            after_rename="after_active_index_rename",
+        )
+
+    def publish_submission_index_if_complete(self, batch_ids: list[str]) -> None:
+        """Persist fingerprints only when every enumerated manifest was validated."""
+
+        if set(batch_ids) != set(self._submission_identities):
+            return
+        seen_submission_ids: set[str] = set()
+        for batch_id in batch_ids:
+            remembered = self._submission_identities.get(batch_id)
+            current = self.manifest_fingerprint(batch_id)
+            if remembered is None or current != remembered[0]:
+                return
+            submission_id = remembered[1]
+            if submission_id is not None:
+                if submission_id in seen_submission_ids:
+                    return
+                seen_submission_ids.add(submission_id)
+        self._write_submission_index()
+
+    def _load_submission_index(self) -> None:
+        """Load the optional acceleration cache; invalid cache is a safe miss."""
+
+        path = self.root / _SUBMISSION_INDEX_FILENAME
+        try:
+            if path.stat().st_size > _MAX_SUBMISSION_INDEX_BYTES:
+                raise ValueError("submission index is too large")
+            index = SubmissionIndex.model_validate_json(path.read_bytes())
+            loaded: dict[str, tuple[tuple[int, int, int], str | None]] = {}
+            seen_submission_ids: set[str] = set()
+            for entry in index.entries:
+                if entry.batch_id in loaded:
+                    raise ValueError("duplicate batch in submission index")
+                if entry.client_submission_id is not None:
+                    if entry.client_submission_id in seen_submission_ids:
+                        raise ValueError("duplicate submission in submission index")
+                    seen_submission_ids.add(entry.client_submission_id)
+                loaded[entry.batch_id] = (
+                    (entry.inode, entry.size, entry.mtime_ns),
+                    entry.client_submission_id,
+                )
+        except (FileNotFoundError, OSError, ValidationError, ValueError):
+            loaded = {}
+        self._submission_identities = dict(loaded)
+        self._persisted_submission_identities = dict(loaded)
+
+    def _write_submission_index(self) -> None:
+        """Persist the complete validated cache with atomic replacement."""
+
+        if self._submission_identities == self._persisted_submission_identities:
+            return
+        entries = [
+            SubmissionIndexEntry(
+                batch_id=batch_id,
+                inode=fingerprint[0],
+                size=fingerprint[1],
+                mtime_ns=fingerprint[2],
+                client_submission_id=submission_id,
+            )
+            for batch_id, (fingerprint, submission_id) in sorted(
+                self._submission_identities.items()
+            )
+        ]
+        payload = json.dumps(
+            SubmissionIndex(entries=entries).model_dump(mode="json"),
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        self._atomic_write(self.root / _SUBMISSION_INDEX_FILENAME, payload)
+        self._persisted_submission_identities = dict(self._submission_identities)
 
     def try_acquire_worker_presence(self) -> bool:
         """Hold shared presence for the lifetime of an initialized worker process."""
@@ -616,7 +780,13 @@ class FileManifestStore:
         self._write_envelope(manifest, submission, creation=True)
 
     def load(self, batch_id: str) -> BatchManifest:
-        manifest, _ = self._read_manifest_record(batch_id)
+        manifest, submission = self._read_manifest_record(batch_id)
+        fingerprint = self.manifest_fingerprint(batch_id)
+        if fingerprint is not None:
+            self._submission_identities[batch_id] = (
+                fingerprint,
+                submission.client_submission_id if submission is not None else None,
+            )
         return manifest
 
     def find_submission(self, client_submission_id: str) -> SubmissionMatch | None:
@@ -696,6 +866,7 @@ class FileManifestStore:
             self._submission_identities = {}
             return True
         self._submission_identities = validated
+        self._write_submission_index()
         return False
 
     def _submission_namespace_fingerprint(self) -> tuple[tuple[str, int, int, int], ...]:

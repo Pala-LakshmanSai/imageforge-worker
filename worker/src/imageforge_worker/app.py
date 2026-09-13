@@ -4,6 +4,7 @@ import asyncio
 import base64
 import logging
 import os
+import time
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -187,7 +188,15 @@ async def _boot(runtime: WorkerRuntime) -> None:
     try:
         await runtime.health.transition(HealthPhase.PROCESS, 1.0)
         await runtime.health.transition(HealthPhase.STORAGE, 0.1)
+        storage_started = time.perf_counter()
+        logger.info("storage recovery started")
         await runtime.controller.initialize()
+        logger.info(
+            "storage recovery complete elapsed_seconds=%.3f manifest_reads=%d cache_hits=%d",
+            time.perf_counter() - storage_started,
+            int(getattr(runtime.store, "volume_manifest_reads", 0)),
+            int(getattr(runtime.store, "manifest_cache_hits", 0)),
+        )
         await runtime.health.transition(HealthPhase.STORAGE, 1.0)
         await runtime.inference.startup(runtime.health.transition)
     except asyncio.CancelledError:
